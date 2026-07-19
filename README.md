@@ -286,7 +286,7 @@ platform).
 ## Support the project
 
 Sona is built and maintained by one person for the community. If it's useful to you,
-you can [sponsor its development](https://github.com/sponsors/sparkyfen) — sponsorship
+you can [sponsor its development](https://github.com/sponsors/sona-fast) — sponsorship
 covers hosting/domain costs and funds new features. Not required, always appreciated.
 
 Want a fork set up or hosted for you? That's offered as an optional paid convenience —

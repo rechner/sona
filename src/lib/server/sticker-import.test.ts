@@ -869,12 +869,12 @@ describe('importStickerBatch', () => {
 //    cleanup at ~L799 only fires for a pack THIS call created), and vice versa;
 //  - the realistic case where the SAME art carries DIFFERENT file_unique_ids in the
 //    two sets — both import fully and each pack keeps its own copy.
-// Named after the owner's real packs (t.me/addstickers/SparkyFen + /Sparky84453).
+// Two example packs used purely as distinct identifiers for the cross-pack safety tests.
 describe('importStickerBatch cross-pack shared-file safety', () => {
-	const PACK_A = 'sparkyfen';
-	const PACK_B = 'sparky84453';
-	const A_URL = 'https://t.me/addstickers/sparkyfen';
-	const B_URL = 'https://t.me/addstickers/sparky84453';
+	const PACK_A = 'examplefox';
+	const PACK_B = 'examplepack99';
+	const A_URL = 'https://t.me/addstickers/examplefox';
+	const B_URL = 'https://t.me/addstickers/examplepack99';
 
 	const fakeBucket = {
 		put: vi.fn(async () => {}),
@@ -935,12 +935,12 @@ describe('importStickerBatch cross-pack shared-file safety', () => {
 		mockSets({
 			[PACK_A]: {
 				name: PACK_A,
-				title: 'SparkyFen',
+				title: 'ExampleFox',
 				stickers: [{ fileId: 'a-shared', fileUniqueId: 'shared-1', emoji: '😀', format: 'webp' as const, width: 512, height: 512 }]
 			},
 			[PACK_B]: {
 				name: PACK_B,
-				title: 'Sparky84453',
+				title: 'ExamplePack99',
 				stickers: [
 					{ fileId: 'b-shared', fileUniqueId: 'shared-1', emoji: '😀', format: 'webp' as const, width: 512, height: 512 },
 					{ fileId: 'b-only', fileUniqueId: 'b-only-1', emoji: '🔥', format: 'webp' as const, width: 512, height: 512 }
@@ -989,12 +989,12 @@ describe('importStickerBatch cross-pack shared-file safety', () => {
 		mockSets({
 			[PACK_A]: {
 				name: PACK_A,
-				title: 'SparkyFen',
+				title: 'ExampleFox',
 				stickers: [{ fileId: 'a-shared', fileUniqueId: 'shared-1', emoji: '😀', format: 'webp' as const, width: 512, height: 512 }]
 			},
 			[PACK_B]: {
 				name: PACK_B,
-				title: 'Sparky84453',
+				title: 'ExamplePack99',
 				stickers: [
 					{ fileId: 'b-shared', fileUniqueId: 'shared-1', emoji: '😀', format: 'webp' as const, width: 512, height: 512 },
 					{ fileId: 'b-only', fileUniqueId: 'b-only-1', emoji: '🔥', format: 'webp' as const, width: 512, height: 512 }
@@ -1055,12 +1055,12 @@ describe('importStickerBatch cross-pack shared-file safety', () => {
 		mockSets({
 			[PACK_A]: {
 				name: PACK_A,
-				title: 'SparkyFen',
+				title: 'ExampleFox',
 				stickers: [{ fileId: 'a-png', fileUniqueId: 'png-copy-a', emoji: '😀', format: 'webp' as const, width: 512, height: 512 }]
 			},
 			[PACK_B]: {
 				name: PACK_B,
-				title: 'Sparky84453',
+				title: 'ExamplePack99',
 				stickers: [{ fileId: 'b-png', fileUniqueId: 'png-copy-b', emoji: '😀', format: 'webp' as const, width: 512, height: 512 }]
 			}
 		});

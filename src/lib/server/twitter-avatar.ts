@@ -18,7 +18,7 @@ const X_USER_BY_SCREEN_NAME = 'https://api.x.com/graphql/IGgvgiOx4QZndDHuD3x9TQ/
 const FETCH_TIMEOUT_MS = 5000;
 
 /** Extract a bare handle from the stored twitter URL formats
- * ("https://x.com/@SparkyFen/", "twitter.com/sparkyfen", "@sparkyfen"). */
+ * ("https://x.com/@ExampleFox/", "twitter.com/examplefox", "@examplefox"). */
 export function twitterHandleFromUrl(twitterUrl: string): string {
 	return twitterUrl
 		.replace(/^https?:\/\//, '')
