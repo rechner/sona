@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { adminLogin } from './admin-login';
 
 // Supporter-key settings flow (SONA-105): the Account tab's empty state renders
 // (explainer + Key field), a garbage key is rejected with the invalid error AND
@@ -22,11 +23,7 @@ const EXPIRED_TOKEN =
 	'eyJ2IjoxLCJsb2dpbiI6Imtub3duLWFuc3dlciIsInRpZXIiOjgsImV4cCI6MTc1MjcxMDQwMH0.fr25p4GX1PXoTdqBTBTYQImZGdGKo13I5GDil_KXNi2dDVxBQaNiLQ5sGoVcapBmjPxV-0ADYAKCaFP-_CDTDA';
 
 async function login(page: Page) {
-	await page.goto('/admin/login');
-	await page.fill('input[name="password"]', PASSWORD);
-	// Plain form POST — works pre-hydration, then redirects to /admin/images.
-	await page.click('button[type="submit"]');
-	await page.waitForURL(/\/admin\/images/);
+	await adminLogin(page, PASSWORD);
 }
 
 const keyInput = (page: Page) => page.locator('input[name="supporterKey"]');

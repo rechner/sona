@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { adminLogin } from './admin-login';
 
 // Regression spec for #193: the visitor percentage bars on /admin/observability
 // rendered as empty grey tracks because the fill elements are inline <span>s,
@@ -18,10 +19,7 @@ import { test, expect, type Page } from '@playwright/test';
 const PASSWORD = 'e2e-admin-password';
 
 async function login(page: Page) {
-	await page.goto('/admin/login');
-	await page.fill('input[name="password"]', PASSWORD);
-	await page.click('button[type="submit"]');
-	await page.waitForURL(/\/admin\/images/);
+	await adminLogin(page, PASSWORD);
 }
 
 async function expectFillPaints(page: Page, fillSel: string, trackSel: string) {

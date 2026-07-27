@@ -27,6 +27,12 @@ RESEND_API_KEY = "e2e-resend-key"
 # item/settings tab — checked against the other shared-server specs (name-based
 # selectors, isolated tables) and harmless.
 OBSERVABILITY_ENABLED = "true"
+# Cloudflare's official Turnstile TEST keys: the site key auto-solves the widget
+# and the secret verifies ANY token as success — so admin login runs enforced
+# (TURNSTILE_SECRET present) yet passes deterministically under Playwright. Not
+# real secrets; safe to commit.
+TURNSTILE_SITEKEY = "1x00000000000000000000AA"
+TURNSTILE_SECRET = "1x0000000000000000000000000000000AA"
 
 [[d1_databases]]
 binding = "DB"
