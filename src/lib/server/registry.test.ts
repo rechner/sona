@@ -1,15 +1,19 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+	isFatalRefusal,
 	isRegistryEnabled,
+	isRegistryRefusal,
 	artistSocials,
 	firstHandle,
 	isLocalNameAliasOf,
 	parseAliases,
+	registryDelta,
 	registryRegisterFork,
 	registrySubmit,
 	resolveRegistryEnv,
 	REGISTRY_API_KEY_SETTING,
-	REGISTRY_URL_SETTING
+	REGISTRY_URL_SETTING,
+	type RegistryArtist
 } from './registry';
 import { getRawSetting } from './settings';
 
@@ -149,6 +153,113 @@ describe('registryRegisterFork', () => {
 		expect(result).toEqual({
 			error: 'the registry did not respond — check the URL and try again'
 		});
+	});
+});
+
+describe('isRegistryRefusal', () => {
+	it('is true only for the typed refusal shape', () => {
+		expect(isRegistryRefusal({ error: 'invalid fork key', httpStatus: 401 })).toBe(true);
+	});
+
+	it('is false for every success / empty shape', () => {
+		expect(isRegistryRefusal([])).toBe(false); // an empty catalog is not a refusal
+		expect(isRegistryRefusal({})).toBe(false);
+		expect(isRegistryRefusal(null)).toBe(false);
+		expect(isRegistryRefusal(undefined)).toBe(false);
+		expect(isRegistryRefusal({ artists: [], nextCursor: null })).toBe(false);
+		const catalog: Pick<RegistryArtist, 'globalId' | 'displayName'>[] = [
+			{ globalId: 'g1', displayName: 'Nyx' }
+		];
+		expect(isRegistryRefusal(catalog)).toBe(false);
+	});
+
+	it('is false when the fields are the wrong type or ride along a success payload', () => {
+		// Untrusted wire data: duck-typing on field PRESENCE would let a 200 page that
+		// happens to carry these keys read as a refusal to every caller.
+		expect(isRegistryRefusal({ error: 401, httpStatus: 'nope' })).toBe(false);
+		expect(isRegistryRefusal({ error: 'x', httpStatus: '401' })).toBe(false);
+		expect(isRegistryRefusal({ error: 'x', httpStatus: 401, artists: [] })).toBe(false);
+	});
+});
+
+describe('isFatalRefusal', () => {
+	it('is true only for the auth statuses (401/403)', () => {
+		expect(isFatalRefusal(401)).toBe(true);
+		expect(isFatalRefusal(403)).toBe(true);
+	});
+
+	// A rate-limit / timeout / validation error is transient or narrow: failing a whole
+	// sync or import run for it turns a self-correcting condition into a failed job.
+	it('is false for transient 4xx statuses', () => {
+		expect(isFatalRefusal(429)).toBe(false);
+		expect(isFatalRefusal(408)).toBe(false);
+		expect(isFatalRefusal(400)).toBe(false);
+		expect(isFatalRefusal(409)).toBe(false);
+	});
+});
+
+describe('registryDelta', () => {
+	afterEach(() => vi.unstubAllGlobals());
+	const env = { REGISTRY_API_KEY: 'fork-key' } as App.Platform['env'];
+
+	it('GETs the delta feed with the auth header', async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(new Response(JSON.stringify({ artists: [], nextCursor: null })));
+		vi.stubGlobal('fetch', fetchMock);
+
+		const result = await registryDelta(env, { updatedSince: '2026-01-01T00:00:00Z', limit: 100 });
+		expect(result).toEqual({ artists: [], nextCursor: null });
+
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(url).toContain('/v1/artists?updated_since=');
+		expect((init.headers as Record<string, string>).authorization).toBe('Bearer fork-key');
+	});
+
+	it('surfaces a 401 as a typed refusal instead of an empty page', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ error: 'invalid fork key' }), { status: 401 })
+			)
+		);
+		expect(await registryDelta(env, {})).toEqual({ error: 'invalid fork key', httpStatus: 401 });
+	});
+
+	// A JSON error body on purpose: with a non-JSON body this would pass via the
+	// parse fallback even if the refusal range were widened to every non-ok status,
+	// so it would stop guarding the 4xx-only rule.
+	it('still fails soft (empty page) on a 5xx', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ error: 'registry down' }), {
+					status: 502,
+					headers: { 'content-type': 'application/json' }
+				})
+			)
+		);
+		expect(await registryDelta(env, {})).toEqual({ artists: [], nextCursor: null });
+	});
+
+	// Anything in front of the registry (a WAF, an Access login page) answers 4xx with
+	// HTML. Without a usable `error` string that used to fall through to the empty-page
+	// fallback — the silent empty catalogue this whole path exists to remove.
+	it.each([
+		['an HTML body', 403, 'error 1020: Access denied', 'HTTP 403'],
+		['a JSON body with no `error` field', 401, JSON.stringify({ message: 'unauthorized' }), 'HTTP 401'],
+		['an empty `error` string', 401, JSON.stringify({ error: '' }), 'HTTP 401'],
+		['a whitespace-only `error` string', 429, JSON.stringify({ error: '  \n' }), 'HTTP 429']
+	])('still reports a refusal for a 4xx with %s', async (_label, status, body, expected) => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status })));
+		expect(await registryDelta(env, {})).toEqual({ error: expected, httpStatus: status });
+	});
+
+	it('returns an empty page (and sends nothing) when the registry is not configured', async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal('fetch', fetchMock);
+		expect(await registryDelta(undefined, {})).toEqual({ artists: [], nextCursor: null });
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
 

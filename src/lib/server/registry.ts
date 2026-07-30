@@ -142,6 +142,41 @@ export interface RegistryRefusal {
 	httpStatus: number;
 }
 
+/** Narrow a registry result to a refusal. The body is untrusted wire data, so this
+ *  checks the field TYPES (not just their presence) and rejects anything carrying a
+ *  success payload — a 200 body that happens to include `error`/`httpStatus` must not
+ *  make every caller treat a real catalogue page as a refusal. */
+export function isRegistryRefusal(value: unknown): value is RegistryRefusal {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const v = value as Record<string, unknown>;
+	return typeof v.error === 'string' && typeof v.httpStatus === 'number' && !('artists' in v);
+}
+
+/**
+ * Which refusal statuses are fatal — i.e. worth failing a whole sync/import run for.
+ * Only 401/403: the fork key is wrong, missing, or revoked, so every later call in the
+ * run fails the same way and no amount of retrying helps; that must be surfaced.
+ * Every other 4xx (429 rate-limited, 408 timeout, 400) is transient or narrow and
+ * self-corrects, so it degrades to a no-op exactly like a 5xx/outage always has.
+ * Shared by artist-sync and registry-import so sync and import agree.
+ */
+export function isFatalRefusal(status: number): boolean {
+	return status === 401 || status === 403;
+}
+
+/** A fatal registry refusal, thrown by syncArtists so callers can tell it apart from
+ *  an unrelated exception (e.g. a D1 error) and show the registry's own reason. */
+export class RegistryRefusalError extends Error {
+	readonly httpStatus: number;
+	readonly reason: string;
+	constructor(httpStatus: number, reason: string) {
+		super(`registry delta refused: HTTP ${httpStatus} — ${reason}`);
+		this.name = 'RegistryRefusalError';
+		this.httpStatus = httpStatus;
+		this.reason = reason;
+	}
+}
+
 async function call<T, R = never>(
 	env: Env | undefined,
 	path: string,
@@ -166,9 +201,14 @@ async function call<T, R = never>(
 			// error. 5xx/network errors still fail soft.
 			if (init.errorBody && res.status >= 400 && res.status < 500) {
 				const body = (await res.json().catch(() => null)) as { error?: string } | null;
-				if (body && typeof body.error === 'string') {
-					return { error: body.error, httpStatus: res.status } as R;
-				}
+				// An unparseable/message-less 4xx body (an HTML error page from a WAF in
+				// front of the registry, say) is still a refusal — falling through to the
+				// fallback here would restore the silent empty-catalogue this guards against.
+				// Blank counts as absent: `{"error":""}` would otherwise reach the operator
+				// as a refusal with nothing in it, which reads as a bug in our own UI.
+				const reason = typeof body?.error === 'string' ? body.error.trim() : '';
+				const error = reason || `HTTP ${res.status}`;
+				return { error, httpStatus: res.status } as R;
 			}
 			return fallback;
 		}
@@ -209,15 +249,22 @@ export async function registryGetArtist(
 export async function registryDelta(
 	env: Env | undefined,
 	params: { updatedSince?: string; cursor?: string; limit?: number }
-): Promise<{ artists: RegistryArtist[]; nextCursor: string | null }> {
+): Promise<{ artists: RegistryArtist[]; nextCursor: string | null } | RegistryRefusal> {
 	const qs = new URLSearchParams();
 	if (params.cursor) qs.set('cursor', params.cursor);
 	else if (params.updatedSince) qs.set('updated_since', params.updatedSince);
 	if (params.limit) qs.set('limit', String(params.limit));
-	return call(env, `/v1/artists?${qs.toString()}`, { method: 'GET' }, {
-		artists: [],
-		nextCursor: null
-	});
+	return call<{ artists: RegistryArtist[]; nextCursor: string | null }, RegistryRefusal>(
+		env,
+		`/v1/artists?${qs.toString()}`,
+		// auth: the delta feed is not public — paging it reveals the whole catalogue
+		// (and what was removed, and when), so the registry requires a fork key.
+		// errorBody: a 4xx here (e.g. 401 from a bad/missing key) must NOT collapse
+		// into an empty page — that's indistinguishable from "no new artists" and
+		// would silently stop imports forever. 5xx/network still fail soft.
+		{ method: 'GET', auth: true, errorBody: true },
+		{ artists: [], nextCursor: null }
+	);
 }
 
 export interface RegistrySubmitResult {

@@ -38,6 +38,7 @@ import {
 	isRegistryEnabled,
 	resolveRegistryEnv,
 	registryRegisterFork,
+	RegistryRefusalError,
 	REGISTRY_API_KEY_SETTING,
 	REGISTRY_URL_SETTING
 } from '$lib/server/registry';
@@ -405,7 +406,19 @@ export const actions = {
 		const renv = await resolveRegistryEnv(db, env);
 		if (!isRegistryEnabled(renv)) return fail(400, { error: 'Shared registry is not configured.' });
 		const settings = await getSettings(db, { fresh: true });
-		const summary = await syncArtists(db, renv, settings);
+		let summary;
+		try {
+			summary = await syncArtists(db, renv, settings);
+		} catch (e) {
+			// A registry refusal (401/403 on a bad/revoked fork key) throws — hand the
+			// registry's own reason back as data so the page renders a LOCALIZED message
+			// around it, instead of a bare 500 page or an untranslated internal string.
+			// Any other exception (a D1 error, say) must not be echoed verbatim to the
+			// operator: return no payload so the page shows its generic sync-failed toast.
+			if (e instanceof RegistryRefusalError)
+				return fail(502, { syncRefusedReason: e.reason.slice(0, 300) });
+			return fail(500, {});
+		}
 		return {
 			success: true,
 			syncMessage: `Sync complete — ${summary.refreshed} refreshed, ${summary.linked} newly linked.`

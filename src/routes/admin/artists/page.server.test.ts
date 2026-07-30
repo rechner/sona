@@ -350,6 +350,62 @@ describe('admin artists load — alias-linked share guard (#71)', () => {
 	});
 });
 
+describe('admin artists load — catalog refusal is surfaced, not silently empty', () => {
+	it('sets registryError (and still lists local artists) when the delta feed 401s', async () => {
+		const { db, platform } = makeDb();
+		await db.insert(siteSettings).values({ key: REGISTRY_API_KEY_SETTING, value: 'stale-key' });
+		await db.insert(schema.artists).values({ name: 'Nyx', globalId: 'g-1' });
+		vi.stubGlobal(
+			'fetch',
+			vi.fn((input: RequestInfo | URL) =>
+				String(input).includes('/v1/artists?')
+					? Promise.resolve(
+							new Response(JSON.stringify({ error: 'invalid fork key' }), { status: 401 })
+						)
+					: Promise.resolve(new Response(JSON.stringify({ submissions: [] })))
+			)
+		);
+
+		const result = (await load(loadEvent(platform))) as {
+			artists: unknown[];
+			registryError: string | null;
+		};
+		// The registry's own words lead, the protocol status trails.
+		expect(result.registryError).toBe('invalid fork key (HTTP 401)');
+		expect(result.artists).toHaveLength(1);
+	});
+
+	// Registry text is untrusted cross-tenant input: a long message must not blow out
+	// the page's error line.
+	it('caps the registry reason at 300 characters', async () => {
+		const { db, platform } = makeDb();
+		await db.insert(siteSettings).values({ key: REGISTRY_API_KEY_SETTING, value: 'stale-key' });
+		await db.insert(schema.artists).values({ name: 'Nyx', globalId: 'g-1' });
+		const long = 'x'.repeat(1000);
+		vi.stubGlobal(
+			'fetch',
+			vi.fn((input: RequestInfo | URL) =>
+				String(input).includes('/v1/artists?')
+					? Promise.resolve(new Response(JSON.stringify({ error: long }), { status: 401 }))
+					: Promise.resolve(new Response(JSON.stringify({ submissions: [] })))
+			)
+		);
+
+		const result = (await load(loadEvent(platform))) as { registryError: string | null };
+		expect(result.registryError).toBe('x'.repeat(300) + ' (HTTP 401)');
+	});
+
+	it('leaves registryError null on a transient outage (unchanged fail-soft behaviour)', async () => {
+		const { db, platform } = makeDb();
+		await db.insert(siteSettings).values({ key: REGISTRY_API_KEY_SETTING, value: 'stored-key' });
+		await db.insert(schema.artists).values({ name: 'Nyx', globalId: 'g-1' });
+		// Default beforeEach stub: every fetch is offline.
+
+		const result = (await load(loadEvent(platform))) as { registryError: string | null };
+		expect(result.registryError).toBeNull();
+	});
+});
+
 describe('submitToRegistry action — surfaces the registry outcome', () => {
 	// Enable the registry via a stored fork key (same path the load tests use) and
 	// seed the artist row the action reads, then return its id.

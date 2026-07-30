@@ -60,6 +60,11 @@ function ra(overrides: Partial<RegistryArtist> & { globalId: string }): Registry
 	};
 }
 
+// What registryDelta returns when the registry refuses the fork key (a fatal 4xx).
+const REFUSAL = { error: 'invalid fork key', httpStatus: 401 };
+// A transient refusal — the read limiter, not a key problem.
+const RATE_LIMITED = { error: 'rate limited — slow down', httpStatus: 429 };
+
 beforeEach(() => {
 	catalogPages = [];
 	deltaCalls = 0;
@@ -82,7 +87,8 @@ describe('fetchRegistryCatalog', () => {
 				nextCursor: null
 			}
 		];
-		const catalog = await fetchRegistryCatalog(env);
+		// Not a refusal on this path (asserted separately below), so narrow to the array.
+		const catalog = (await fetchRegistryCatalog(env)) as RegistryArtist[];
 		expect(catalog.map((a) => a.globalId).sort()).toEqual(['g1', 'g3']);
 		// The duplicate g1 collapsed to the later record.
 		expect(catalog.find((a) => a.globalId === 'g1')?.version).toBe(2);
@@ -93,6 +99,24 @@ describe('fetchRegistryCatalog', () => {
 		// the one unguarded 500 path into the admin artists loader).
 		catalogPages = [{ error: 'oops' } as unknown as (typeof catalogPages)[number]];
 		expect(await fetchRegistryCatalog(env)).toEqual([]);
+	});
+
+	it('returns the refusal (not an empty catalog) when the registry turns us away', async () => {
+		// An empty catalog here would read as "the registry has no artists" — the exact
+		// silent failure a 401 on the delta feed would otherwise cause.
+		catalogPages = [REFUSAL as unknown as (typeof catalogPages)[number]];
+		expect(await fetchRegistryCatalog(env)).toEqual(REFUSAL);
+	});
+
+	// A rate-limit mid-walk is transient: importing the pages already fetched beats
+	// importing nothing, and the next run finishes the walk.
+	it('keeps the pages already fetched when a later page is rate-limited (429)', async () => {
+		catalogPages = [
+			{ artists: [ra({ globalId: 'g1' })], nextCursor: 'c1' },
+			RATE_LIMITED as unknown as (typeof catalogPages)[number]
+		];
+		const catalog = (await fetchRegistryCatalog(env)) as RegistryArtist[];
+		expect(catalog.map((a) => a.globalId)).toEqual(['g1']);
 	});
 });
 
@@ -214,7 +238,7 @@ describe('importRegistryCatalog', () => {
 		];
 		catalogPages = pages;
 		const first = await importRegistryCatalog(db, env);
-		expect(first!.created).toBe(2);
+		expect(first).toMatchObject({ created: 2 });
 
 		deltaCalls = 0;
 		catalogPages = pages;
@@ -226,5 +250,13 @@ describe('importRegistryCatalog', () => {
 	it('returns null when the registry is disabled', async () => {
 		const db = makeDb();
 		expect(await importRegistryCatalog(db, undefined)).toBeNull();
+	});
+
+	it('returns the refusal and imports nothing when the registry turns us away', async () => {
+		const db = makeDb();
+		catalogPages = [REFUSAL as unknown as (typeof catalogPages)[number]];
+
+		expect(await importRegistryCatalog(db, env)).toEqual(REFUSAL);
+		expect(await db.select().from(artists)).toHaveLength(0);
 	});
 });
