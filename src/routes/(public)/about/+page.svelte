@@ -6,22 +6,13 @@
 	import TelegramIcon from '$lib/components/icons/TelegramIcon.svelte';
 	import FurAffinityIcon from '$lib/components/icons/FurAffinityIcon.svelte';
 	import FurTrackIcon from '$lib/components/icons/FurTrackIcon.svelte';
+	import InstagramIcon from '$lib/components/icons/InstagramIcon.svelte';
 	import * as m from '$lib/paraglide/messages';
+	import { atHandleFromUrl, handleFromUrl } from '$lib/social-label';
 
 	let { data } = $props();
 	let settings = $derived(data.settings);
 	let stats = $derived(data.stats);
-
-	// FurTrack and FurAffinity profile URLs are .../user/<handle> — show the handle
-	// like the other socials do, rather than the platform name.
-	function handleFromUrl(url: string | undefined, fallback: string): string {
-		if (!url) return fallback;
-		try {
-			return new URL(url).pathname.split('/').filter(Boolean).pop() ?? fallback;
-		} catch {
-			return fallback;
-		}
-	}
 
 	const ownerName = $derived(settings.ownerName || settings.siteName);
 
@@ -36,11 +27,12 @@
 	}
 
 	const socialLinks = $derived([
-		{ url: settings.twitterUrl, icon: TwitterIcon, label: settings.twitterUrl ? `@${handleFromUrl(settings.twitterUrl, 'Twitter')}` : 'Twitter' },
+		{ url: settings.twitterUrl, icon: TwitterIcon, label: atHandleFromUrl(settings.twitterUrl, 'Twitter') },
 		{ url: settings.telegramUrl, icon: TelegramIcon, label: handleFromUrl(settings.telegramUrl, 'Telegram') },
 		{ url: settings.blueskyUrl, icon: BlueskyIcon, label: handleFromUrl(settings.blueskyUrl, 'Bluesky') },
 		{ url: settings.furAffinityUrl, icon: FurAffinityIcon, label: handleFromUrl(settings.furAffinityUrl, 'FurAffinity') },
-		{ url: settings.furtrackUrl, icon: FurTrackIcon, label: handleFromUrl(settings.furtrackUrl, 'FurTrack') }
+		{ url: settings.furtrackUrl, icon: FurTrackIcon, label: handleFromUrl(settings.furtrackUrl, 'FurTrack') },
+		{ url: settings.instagramUrl, icon: InstagramIcon, label: atHandleFromUrl(settings.instagramUrl, 'Instagram') }
 	].filter((l) => l.url));
 </script>
 
@@ -81,7 +73,7 @@
 			<h3>{m.about_find_elsewhere()}</h3>
 			<div class="social-list">
 				{#each socialLinks as link}
-					<a href={link.url} class="social-item" target="_blank" rel="noopener">
+					<a href={link.url} class="social-item" target="_blank" rel="noopener noreferrer">
 						<link.icon size={18} />
 						<span>{link.label}</span>
 					</a>
