@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { APP_NAME } from '$lib/config';
 	import { page as pageState } from '$app/state';
-	import { Download, ArrowLeft, ChevronRight } from 'lucide-svelte';
+	import { ArrowLeft, ChevronRight } from 'lucide-svelte';
 	import StickerMedia from '$lib/components/StickerMedia.svelte';
+	import DownloadMenu from '$lib/components/DownloadMenu.svelte';
+	import { isRasterFormat, stickerDownloadOptions } from '$lib/sticker-download';
 	import ArtistAvatar from '$lib/components/ArtistAvatar.svelte';
 	import Meta from '$lib/components/Meta.svelte';
 	import TwitterIcon from '$lib/components/icons/TwitterIcon.svelte';
@@ -37,18 +39,48 @@
 	);
 
 	const emojiLabel = $derived(data.sticker.emojis.join(' '));
-	// One download button; label reflects what the endpoint will serve for this type.
-	// Static stickers are served as their original file (WebP/PNG/GIF, animation
-	// intact), so a generic "Download" label avoids mislabelling an animated file.
-	const downloadLabel = $derived(
-		sticker.format === 'video' ? m.stickers_download_webm() : sticker.format === 'animated' ? m.stickers_download_lottie() : m.stickers_download()
+
+	// Download choices come from the shared option logic (the same rules the
+	// endpoint validates against); this page only maps them to labels + hrefs.
+	// options[0] is always the original; a second entry is the PNG conversion,
+	// offered only for non-animated non-PNG rasters.
+	const primaryLabels: Record<string, () => string> = {
+		webm: m.stickers_download_webm,
+		json: m.stickers_download_lottie,
+		webp: m.stickers_download_webp,
+		png: m.stickers_download_png,
+		gif: m.stickers_download_gif
+	};
+	const formatLabels: Record<string, () => string> = {
+		webp: m.stickers_dl_format_webp,
+		png: m.stickers_dl_format_png,
+		gif: m.stickers_dl_format_gif
+	};
+	const downloadOptions = $derived(
+		stickerDownloadOptions(sticker).map((o, i) => ({
+			ext: o.ext,
+			label: (formatLabels[o.ext] ?? (() => o.ext.toUpperCase()))(),
+			href:
+				o.kind === 'original'
+					? `/stickers/${pack.slug}/${sticker.id}/download`
+					: `/stickers/${pack.slug}/${sticker.id}/download?format=${o.kind}`,
+			hint: i === 0 ? m.stickers_dl_original() : m.stickers_dl_converted()
+		}))
 	);
+	const downloadLabel = $derived((primaryLabels[downloadOptions[0].ext] ?? m.stickers_download)());
+
+	// Fire-and-forget beacon so the admin dashboard can count download presses
+	// (same aggregate counter the gallery download button feeds). Failures must
+	// never block the visitor's download.
+	function countDownload() {
+		void fetch('/api/metrics/download', { method: 'POST', keepalive: true }).catch(() => {});
+	}
 	// Social previews need a static image. Animated stickers are .json (Lottie) and
 	// video stickers are .webm — neither renders as an OG image — so only use the
 	// sticker's own imageUrl when it's a static format, else fall back to a static
 	// pack preview or the sticker's thumbnail.
 	const metaImage = $derived(
-		sticker.format === 'png' || sticker.format === 'webp'
+		isRasterFormat(sticker.format)
 			? sticker.imageUrl
 			: pack.previewImages?.[0] ?? sticker.thumbnailUrl ?? null
 	);
@@ -130,10 +162,15 @@
 
 			<!-- Per-sticker download (the pack-level "Add to Telegram" lives on the pack page). -->
 			<div class="download-group">
-				<a href="/stickers/{pack.slug}/{sticker.id}/download" class="btn btn-primary download-btn" download>
-					<Download size={16} />
-					{downloadLabel}
-				</a>
+				<DownloadMenu
+					options={downloadOptions}
+					label={downloadLabel}
+					menuLabel={m.stickers_dl_choose_format()}
+					onDownload={countDownload}
+				/>
+				{#if isRasterFormat(sticker.format) && sticker.isAnimated}
+					<p class="dl-caption dl-note-animated">{m.stickers_dl_animated_note()}</p>
+				{/if}
 				<p class="dl-caption">{m.stickers_dl_caption_before()}<a href="/stickers/{pack.slug}">{m.stickers_dl_caption_link()}</a>{m.stickers_dl_caption_after()}</p>
 			</div>
 		</div>
@@ -361,11 +398,6 @@
 		gap: 8px;
 	}
 
-	.download-btn {
-		display: flex;
-		width: 100%;
-	}
-
 	.dl-caption {
 		font-size: 12px;
 		line-height: 1.4;
@@ -375,6 +407,14 @@
 
 	.dl-caption a {
 		color: var(--primary);
+	}
+
+	/* The "PNG isn't offered" note explains the button directly above it — pull
+	   it closer (4px effective gap) and weight it above the boilerplate caption. */
+	.dl-note-animated {
+		margin-top: -4px;
+		color: var(--foreground);
+		font-weight: 500;
 	}
 
 	@media (max-width: 768px) {

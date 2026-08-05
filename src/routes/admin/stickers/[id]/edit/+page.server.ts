@@ -50,7 +50,7 @@ export const load: PageServerLoad = async ({ params, platform }) => {
 };
 
 export const actions = {
-	default: async ({ params, request, platform, url }) => {
+	default: async ({ params, request, platform, url, fetch }) => {
 		const db = getDb(platform!.env.DB);
 		const settings = await getSettings(db);
 		const packId = Number(params.id);
@@ -90,7 +90,13 @@ export const actions = {
 				settings,
 				db,
 				packId,
-				input: { name, description, coverImageUrl, managerArtistId, telegramUrl, published, stickerInputs }
+				input: { name, description, coverImageUrl, managerArtistId, telegramUrl, published, stickerInputs },
+				// Origin + EVENT fetch, deliberately: SvelteKit's fetch resolves
+				// root-relative /img/<key> stored URLs through the app router so the
+				// sniff can read them (a bare fetch would record every one as
+				// static). Admin-only action, so the cookie-carrying fetch is fine.
+				origin: url.origin,
+				fetchFn: fetch
 			});
 		} catch (e) {
 			return fail(400, { error: e instanceof Error ? e.message : 'Could not save pack.' });

@@ -361,6 +361,50 @@ describe('authHandle — 5xx counts toward the error rate (issue #6)', () => {
 	});
 });
 
+describe('authHandle — cache-control stamping honors handler opt-outs (SONA-123)', () => {
+	beforeEach(() => {
+		vi.mocked(isSetupComplete).mockResolvedValue(true);
+	});
+
+	it('stamps the public edge default on a public non-HTML 200 with no explicit header', async () => {
+		const db = makeDb();
+		const res = (await authHandle({
+			event: makeEvent('/stickers/pack/7/download', db),
+			resolve: async () => new Response('bytes', { headers: { 'content-type': 'image/webp' } })
+		} as never)) as Response;
+		expect(res.headers.get('Cache-Control')).toBe('public, s-maxage=300, stale-while-revalidate=3600');
+	});
+
+	it('keeps a handler-set Cache-Control (the download fallback must stay no-store)', async () => {
+		const db = makeDb();
+		const res = (await authHandle({
+			event: makeEvent('/stickers/pack/7/download', db),
+			resolve: async () =>
+				new Response('bytes', {
+					headers: { 'content-type': 'image/webp', 'cache-control': 'private, no-store' }
+				})
+		} as never)) as Response;
+		expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+	});
+
+	it('keeps /img/[...key] on its immutable year-long cache (the other opt-out)', async () => {
+		// UUID-keyed R2 objects never change, so the route sets its own immutable
+		// header — the hooks stamp must not shorten it to the s-maxage default.
+		const db = makeDb();
+		const res = (await authHandle({
+			event: makeEvent('/img/stickers/pack/key.webp', db),
+			resolve: async () =>
+				new Response('bytes', {
+					headers: {
+						'content-type': 'image/webp',
+						'cache-control': 'public, max-age=31536000, immutable'
+					}
+				})
+		} as never)) as Response;
+		expect(res.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+	});
+});
+
 describe('authHandle — security response headers', () => {
 	beforeEach(() => {
 		vi.mocked(isSetupComplete).mockResolvedValue(true);

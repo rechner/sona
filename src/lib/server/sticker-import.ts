@@ -19,6 +19,9 @@ import type { TelegramSticker } from '$lib/server/telegram';
 import { resolveStickerArtistIds, inferAppendedArtistId } from '$lib/server/stickers';
 import type { AvatarRehostContext } from '$lib/server/avatar';
 import { slugify } from '$lib/server/slugify';
+import { isAnimatedRaster, sniffAnimatedFromUrl } from '$lib/server/animated-raster';
+import { isRasterFormat } from '$lib/sticker-download';
+import { mapWithConcurrency } from '$lib/server/concurrency';
 import { sanitizeUrl } from '$lib/server/validate';
 
 type Env = App.Platform['env'];
@@ -310,6 +313,7 @@ type StickerRowValues = {
 	width?: number | null;
 	height?: number | null;
 	format: 'png' | 'webp' | 'animated' | 'video';
+	isAnimated?: boolean;
 	nsfw: boolean;
 	telegramFileUniqueId?: string | null;
 };
@@ -459,7 +463,7 @@ async function downloadAndStoreSticker(opts: {
 	packSlug: string;
 	sticker: TelegramSticker;
 	absolutize: (url: string) => string;
-}): Promise<{ storedUrl: string; format: 'png' | 'webp' | 'animated' | 'video' }> {
+}): Promise<{ storedUrl: string; format: 'png' | 'webp' | 'animated' | 'video'; isAnimated: boolean }> {
 	const { env, storage, packSlug, sticker, absolutize } = opts;
 	const { bytes, filePath } = await downloadFile(env, sticker.fileId);
 	const uuid = crypto.randomUUID();
@@ -473,7 +477,7 @@ async function downloadAndStoreSticker(opts: {
 			contentType: 'application/json',
 			filename: `${uuid}.json`
 		});
-		return { storedUrl: absolutize(url), format: 'animated' };
+		return { storedUrl: absolutize(url), format: 'animated', isAnimated: true };
 	}
 
 	// Static raster or video. Telegram serves these as octet-stream, so derive the
@@ -487,7 +491,11 @@ async function downloadAndStoreSticker(opts: {
 		contentType: ct,
 		filename: `${uuid}.${ext}`
 	});
-	return { storedUrl: absolutize(url), format: formatFromContentType(ct, sticker.format) };
+	const format = formatFromContentType(ct, sticker.format);
+	// Videos always animate; "static" rasters are sniffed for animated WebP/GIF
+	// so the download endpoint never offers a flattening PNG conversion.
+	const isAnimated = format === 'video' || isAnimatedRaster(new Uint8Array(bytes));
+	return { storedUrl: absolutize(url), format, isAnimated };
 }
 
 export async function importTelegramPack(opts: {
@@ -575,7 +583,7 @@ export async function importTelegramPack(opts: {
 	for (const { sticker, index } of toImport) {
 		try {
 			const override = perSticker[index];
-			const { storedUrl, format } = await downloadAndStoreSticker({ env, storage, packSlug, sticker, absolutize });
+			const { storedUrl, format, isAnimated } = await downloadAndStoreSticker({ env, storage, packSlug, sticker, absolutize });
 
 			const didInsert = await insertStickerWithEmojis(
 				db,
@@ -586,6 +594,7 @@ export async function importTelegramPack(opts: {
 					width: sticker.width,
 					height: sticker.height,
 					format,
+					isAnimated,
 					position,
 					nsfw: override?.nsfw ?? false,
 					telegramFileUniqueId: sticker.fileUniqueId
@@ -764,7 +773,7 @@ export async function importStickerBatch(opts: {
 
 		// New sticker → download + store + insert.
 		try {
-			const { storedUrl, format } = await downloadAndStoreSticker({ env, storage, packSlug, sticker, absolutize });
+			const { storedUrl, format, isAnimated } = await downloadAndStoreSticker({ env, storage, packSlug, sticker, absolutize });
 			const didInsert = await insertStickerWithEmojis(
 				db,
 				{
@@ -774,6 +783,7 @@ export async function importStickerBatch(opts: {
 					width: sticker.width,
 					height: sticker.height,
 					format,
+					isAnimated,
 					position,
 					nsfw: item.nsfw,
 					telegramFileUniqueId: sticker.fileUniqueId
@@ -925,7 +935,7 @@ export async function resyncTelegramPacks(opts: {
 						break;
 					}
 					try {
-						const { storedUrl, format } = await downloadAndStoreSticker({ env, storage, packSlug: pack.slug, sticker, absolutize });
+						const { storedUrl, format, isAnimated } = await downloadAndStoreSticker({ env, storage, packSlug: pack.slug, sticker, absolutize });
 						const didInsert = await insertStickerWithEmojis(
 							db,
 							{
@@ -935,6 +945,7 @@ export async function resyncTelegramPacks(opts: {
 								width: sticker.width,
 								height: sticker.height,
 								format,
+								isAnimated,
 								position,
 								nsfw: false,
 								telegramFileUniqueId: sticker.fileUniqueId
@@ -1042,6 +1053,29 @@ export function parseStickerFormInputs(data: FormData, defaultArtistId: number |
 	return inputs;
 }
 
+// Sniff cap: a manual pack can hold 100+ stickers; fetching every raster at
+// once would blow the Workers subrequest/connection budget.
+const SNIFF_CONCURRENCY = 4;
+
+/**
+ * Animation flag for ONE manual-save input: rasters are sniffed by URL (null =
+ * undetermined — callers pick the default), video/Lottie are always animated.
+ * Callers fan this out via mapWithConcurrency (at most SNIFF_CONCURRENCY
+ * fetches at a time) and short-circuit rows they don't want fetched there.
+ * fetchFn is deliberately the EVENT fetch (unlike the download transform path):
+ * it resolves root-relative /img/<key> stored URLs through the app router, and
+ * these are admin-only save flows, so the cookie-carrying fetch is fine here.
+ */
+function sniffManualInput(
+	s: ManualStickerInput,
+	fetchFn: typeof fetch,
+	origin?: string
+): Promise<boolean | null> {
+	return isRasterFormat(s.format)
+		? sniffAnimatedFromUrl(s.imageUrl, fetchFn, origin)
+		: Promise.resolve(true);
+}
+
 /**
  * Reject any sticker/cover URL we don't host ourselves. The manual form only ever
  * submits URLs returned by /api/upload (our storage), so a URL we don't own means
@@ -1082,8 +1116,12 @@ export async function saveManualPack(opts: {
 	settings: SiteSettings;
 	db: Database;
 	input: ManualPackInput;
+	/** Request origin so root-relative stored URLs (/img/<key>) can be sniffed. */
+	origin?: string;
+	/** Fetch used for the animation sniff (event fetch / test seam). */
+	fetchFn?: typeof fetch;
 }): Promise<{ packId: number; slug: string }> {
-	const { env, settings, db, input } = opts;
+	const { env, settings, db, input, origin, fetchFn = fetch } = opts;
 	assertSelfHosted(env, settings, input);
 
 	const characterId = await resolveSiteCharacterId(db, settings);
@@ -1100,6 +1138,13 @@ export async function saveManualPack(opts: {
 	const packId = await nextPackId(db);
 	const startId = await nextStickerId(db);
 
+	// Best-effort animation sniff for the freshly uploaded rasters (see
+	// sniffAnimatedFromUrl); an undetermined sniff (null) defaults to static,
+	// which the backfill endpoint can correct later.
+	const sniffed = await mapWithConcurrency(input.stickerInputs, SNIFF_CONCURRENCY, (s) =>
+		sniffManualInput(s, fetchFn, origin)
+	);
+
 	const rows = input.stickerInputs.map((s, i) => ({
 		packId,
 		artistId: resolvedArtistIds[i],
@@ -1107,6 +1152,7 @@ export async function saveManualPack(opts: {
 		width: s.width ?? null,
 		height: s.height ?? null,
 		format: s.format,
+		isAnimated: sniffed[i] ?? false,
 		position: s.position,
 		nsfw: s.nsfw,
 		emojis: s.emojis
@@ -1143,8 +1189,12 @@ export async function updateManualPack(opts: {
 	db: Database;
 	packId: number;
 	input: ManualPackInput;
+	/** Request origin so root-relative stored URLs (/img/<key>) can be sniffed. */
+	origin?: string;
+	/** Fetch used for the animation sniff (event fetch / test seam). */
+	fetchFn?: typeof fetch;
 }): Promise<void> {
-	const { env, settings, db, packId, input } = opts;
+	const { env, settings, db, packId, input, origin, fetchFn = fetch } = opts;
 
 	// Snapshot existing stickers before we mutate. We need imageUrl for storage
 	// cleanup AND width/height/telegramFileUniqueId so the edit PRESERVES the columns
@@ -1158,6 +1208,7 @@ export async function updateManualPack(opts: {
 			imageUrl: stickers.imageUrl,
 			width: stickers.width,
 			height: stickers.height,
+			isAnimated: stickers.isAnimated,
 			telegramFileUniqueId: stickers.telegramFileUniqueId
 		})
 		.from(stickers)
@@ -1179,6 +1230,14 @@ export async function updateManualPack(opts: {
 
 	const resolvedArtistIds = resolveStickerArtistIds(input.managerArtistId, input.stickerInputs.map((s) => s.artistId));
 
+	// Animation flags: a row kept across the edit (same imageUrl) carries its prior
+	// flag — short-circuited here so it is never fetched; a NEW raster upload gets
+	// a best-effort sniff. Kept rows were already sniffed (or backfilled), so this
+	// only fetches the handful of new files.
+	const sniffed = await mapWithConcurrency(input.stickerInputs, SNIFF_CONCURRENCY, async (s) =>
+		preserved.has(s.imageUrl) ? null : sniffManualInput(s, fetchFn, origin)
+	);
+
 	const rows = input.stickerInputs.map((s, i) => {
 		const prior = preserved.get(s.imageUrl);
 		return {
@@ -1190,6 +1249,7 @@ export async function updateManualPack(opts: {
 			width: s.width ?? prior?.width ?? null,
 			height: s.height ?? prior?.height ?? null,
 			format: s.format,
+			isAnimated: prior?.isAnimated ?? sniffed[i] ?? false,
 			position: s.position,
 			nsfw: s.nsfw,
 			telegramFileUniqueId: prior?.telegramFileUniqueId ?? null,

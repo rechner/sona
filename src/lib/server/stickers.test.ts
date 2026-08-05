@@ -145,7 +145,8 @@ function makeDb(): Db {
 		CREATE TABLE stickers (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, pack_id INTEGER NOT NULL, artist_id INTEGER,
 			image_url TEXT NOT NULL, thumbnail_url TEXT, width INTEGER, height INTEGER,
-			format TEXT NOT NULL DEFAULT 'webp', position INTEGER NOT NULL DEFAULT 0,
+			format TEXT NOT NULL DEFAULT 'webp', is_animated INTEGER NOT NULL DEFAULT 0,
+			position INTEGER NOT NULL DEFAULT 0,
 			nsfw INTEGER NOT NULL DEFAULT 0, telegram_file_unique_id TEXT, created_at TEXT NOT NULL
 		);
 		CREATE TABLE sticker_emojis (sticker_id INTEGER NOT NULL, emoji TEXT NOT NULL);
@@ -186,6 +187,22 @@ describe('findStickers (emoji IN-list chunking past D1 param cap)', () => {
 		// B (position 1) before A (position 5); each once; C excluded.
 		expect(found.map((s) => s.id)).toEqual([b, a]);
 		expect(found).toHaveLength(2);
+	});
+
+	it('carries is_animated through to the sticker views (drives the PNG download option)', async () => {
+		const db = makeDb();
+		await db.insert(schema.characters).values({ name: 'Sparky' });
+		await db.insert(schema.stickerPacks).values({ name: 'Pack', slug: 'pack', characterId: 1, source: 'self-hosted', published: true });
+		await db.insert(schema.stickers).values([
+			{ packId: 1, imageUrl: 'anim.webp', position: 0, isAnimated: true },
+			{ packId: 1, imageUrl: 'still.webp', position: 1, isAnimated: false }
+		]);
+
+		const views = await findStickers(db, { publishedOnly: true });
+		expect(views.map((s) => [s.imageUrl, s.isAnimated])).toEqual([
+			['anim.webp', true],
+			['still.webp', false]
+		]);
 	});
 
 	it('still returns matches when publishedOnly is false', async () => {
