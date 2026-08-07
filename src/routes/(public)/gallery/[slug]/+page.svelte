@@ -140,7 +140,7 @@
 				<div>
 					<a class="artist-name" href="/gallery?artist={encodeURIComponent(image.artistName ?? '')}">{image.artistName}</a>
 					{#if data.formerNames.length > 0}
-						<div class="aka"><span class="cmt">// {m.gallery_aka_formerly()}</span> {data.formerNames.join(', ')}</div>
+						<div class="aka">{m.gallery_aka_formerly()} {data.formerNames.join(', ')}</div>
 					{/if}
 					{#if image.commissionedAt}
 						<p class="commission-date">{m.gallery_commissioned_date({ date: formatDate(image.commissionedAt) })}</p>
@@ -356,17 +356,13 @@
 		gap: 12px;
 	}
 
-	/* AKA — a quiet mono annotation under the name, like a code comment. */
+	/* AKA — a quiet mono annotation under the name. */
 	.aka {
 		font-family: var(--font-primary);
 		font-size: 12px;
 		color: var(--muted-foreground);
 		margin-top: 2px;
 		letter-spacing: -0.01em;
-	}
-
-	.aka .cmt {
-		opacity: 0.65;
 	}
 
 	.artist-name {

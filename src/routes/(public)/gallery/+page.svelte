@@ -196,7 +196,7 @@
 	{#if data.formerName}
 		<div class="aka-pointer">
 			<div class="txt">
-				<span class="cmt">// {m.gallery_aka_formerly()}</span>{m.gallery_aka_pointer({ old: data.formerName.searched, current: data.formerName.current })}
+				<span class="cmt">{m.gallery_aka_formerly()}</span> {m.gallery_aka_pointer({ old: data.formerName.searched, current: data.formerName.current })}
 			</div>
 			<div class="spacer"></div>
 			<a class="go" href="/gallery?artist={encodeURIComponent(data.formerName.current)}">
@@ -596,7 +596,6 @@
 		font-family: var(--font-primary);
 		font-size: 12px;
 		color: var(--muted-foreground);
-		margin-right: 6px;
 	}
 
 	.aka-pointer .spacer {
