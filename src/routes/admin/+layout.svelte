@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import { enhance } from '$app/forms';
-	import { Upload, Images, Folder, User, PawPrint, Tags, Settings, LogOut, Sun, Moon, Camera, Sticker, CalendarDays, Activity } from 'lucide-svelte';
+	import { Upload, Images, Folder, User, PawPrint, Tags, Settings, LogOut, Sun, Moon, Camera, Sticker, CalendarDays, Activity, X } from 'lucide-svelte';
 	import { getTheme } from '$lib/theme.svelte';
 	import MobileNav from '$lib/components/MobileNav.svelte';
 	import AdminTabs from '$lib/components/AdminTabs.svelte';
@@ -11,6 +11,31 @@
 	let { children, data } = $props();
 
 	const theme = getTheme();
+
+	// Supporter-key expiry notice (SONA-114): shown on every admin page while
+	// the key is inside its warning window. Dismissal is a cookie keyed on the
+	// key's validUntil + warning phase (built server-side as dismissValue, see
+	// +layout.server.ts) so the server load renders the final state on SSR — no
+	// post-hydration layout shift — and an early-phase dismissal re-warns in the
+	// final days. dismissedValue only bridges until the next server load.
+	let dismissedValue = $state<string | null>(null);
+	let mainEl: HTMLElement | undefined = $state();
+	// Populated on dismiss; lives in a persistent polite live region so screen
+	// readers hear a confirmation instead of silence when the banner vanishes.
+	let noticeAnnouncement = $state('');
+	function dismissNotice() {
+		if (!data.supporterKeyNotice) return;
+		// 60 days comfortably outlives any warning window; scoped to the admin area.
+		// The value is URI-encoded (SvelteKit's cookies.get decodes, so it
+		// round-trips); Secure only over https so local HTTP dev keeps working.
+		const secure = location.protocol === 'https:' ? '; Secure' : '';
+		document.cookie = `supporterNoticeDismissed=${encodeURIComponent(data.supporterKeyNotice.dismissValue)}; path=/admin; SameSite=Lax; max-age=5184000${secure}`;
+		dismissedValue = data.supporterKeyNotice.dismissValue;
+		noticeAnnouncement = m.admin_notice_supporter_dismissed_announce();
+		// The dismiss button disappears with the banner — anchor keyboard/SR focus
+		// on the page content instead of dropping it to <body>.
+		mainEl?.focus();
+	}
 
 	// Opt-in gate (issue #6): the Observability item only appears when the feature
 	// is enabled (data.observabilityEnabled from the admin layout load).
@@ -80,7 +105,30 @@
 				</div>
 			</header>
 
-			<main class="admin-content">
+			<main class="admin-content" tabindex="-1" bind:this={mainEl}>
+				<!-- Pre-exists any announcement (a live region injected together with
+				     its content is ignored by most screen readers). -->
+				<p class="sr-only" aria-live="polite">{noticeAnnouncement}</p>
+				{#if data.supporterKeyNotice && data.supporterKeyNotice.dismissValue !== dismissedValue}
+					<div class="supporter-notice">
+						<span class="notice-eyebrow">{m.admin_notice_supporter_eyebrow()}</span>
+						<p>
+							{data.supporterKeyNotice.daysRemaining <= 1
+								? m.admin_notice_supporter_today_pre()
+								: m.admin_notice_supporter_expiring_pre({ days: data.supporterKeyNotice.daysRemaining })}<a
+								class="notice-link"
+								href="https://sona.fast/supporter-key"
+								target="_blank"
+								rel="noopener noreferrer">sona.fast/supporter-key<span class="sr-only"> {m.link_opens_new_tab()}</span></a
+							>{m.admin_notice_supporter_mid()}<a class="notice-link" href="/admin/settings?tab=account"
+								>{m.admin_notice_supporter_settings_link()}</a
+							>{m.admin_notice_supporter_post()}
+						</p>
+						<button type="button" class="notice-dismiss" onclick={dismissNotice} aria-label={m.admin_notice_supporter_dismiss()}>
+							<X size={14} />
+						</button>
+					</div>
+				{/if}
 				{@render children()}
 				<AdminTabs />
 			</main>
@@ -224,6 +272,100 @@
 		padding: 32px;
 	}
 
+	/* Programmatic focus target after dismissing the notice — no visible ring. */
+	.admin-content:focus {
+		outline: none;
+	}
+
+	/* Supporter-key expiry notice (SONA-114) — slim card above page content.
+	   The uppercase eyebrow carries state, matching the settings card. */
+	.supporter-notice {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-s);
+		padding: 10px 10px 10px 16px;
+		margin-bottom: 20px;
+		max-width: 720px;
+	}
+
+	.notice-eyebrow {
+		font-family: var(--font-primary);
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		font-weight: 600;
+		/* Warn, not attention: --status-attention tracks --primary, which in the
+		   default dark theme makes the warning the same orange as every brand
+		   accent. --status-warn is family-stable amber in all themes and AA on
+		   the card. */
+		color: var(--status-warn);
+		flex: none;
+	}
+
+	.supporter-notice p {
+		font-size: 13px;
+		color: var(--foreground);
+		line-height: 1.55;
+		flex: 1;
+		margin: 0;
+		/* Same measure cap as the settings card's nudge/lapsed lines. */
+		max-width: 62ch;
+		/* WCAG reflow at 320px: let the flex item shrink and the unbroken
+		   sona.fast/supporter-key URL wrap instead of forcing horizontal scroll. */
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	/* Screen-reader-only "(opens in a new tab)" on the external link. */
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+
+	.notice-link {
+		color: var(--foreground);
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+
+	.notice-dismiss {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 32px;
+		height: 32px;
+		flex: none;
+		/* Optically center the icon against the first text line. */
+		margin-block-start: -2px;
+		background: none;
+		border: none;
+		border-radius: var(--radius-pill);
+		color: var(--muted-foreground);
+		cursor: pointer;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.notice-dismiss:hover {
+		color: var(--foreground);
+		background: var(--secondary);
+	}
+
+	.notice-dismiss:focus-visible,
+	.notice-link:focus-visible {
+		outline: 2px solid var(--foreground);
+		outline-offset: 2px;
+	}
+
 	.mobile-only {
 		display: none;
 	}
@@ -246,6 +388,33 @@
 
 		.mobile-only {
 			display: contents;
+		}
+	}
+
+	/* Content-driven breakpoint, not the device one: below ~900px the notice
+	   body wraps to 3+ lines beside a one-line eyebrow, so stack the eyebrow
+	   above the body; the dismiss control keeps its top-right slot. */
+	@media (max-width: 900px) {
+		.supporter-notice {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			grid-template-areas:
+				'eyebrow dismiss'
+				'body body';
+			row-gap: 4px;
+		}
+
+		.notice-eyebrow {
+			grid-area: eyebrow;
+			align-self: center;
+		}
+
+		.supporter-notice p {
+			grid-area: body;
+		}
+
+		.notice-dismiss {
+			grid-area: dismiss;
 		}
 	}
 </style>

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance } from '$app/forms';
-	import { invalidateAll } from '$app/navigation';
+	import { afterNavigate, invalidateAll, replaceState } from '$app/navigation';
+	import { page } from '$app/stores';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import SetupDialog from '$lib/components/SetupDialog.svelte';
 	import CopyCommand from '$lib/components/CopyCommand.svelte';
@@ -13,6 +14,7 @@
 	import { THEMES } from '$lib/themes';
 	import { LANDING_LAYOUTS } from '$lib/landing';
 	import { resendSetupProgress } from '$lib/resend-setup';
+	import { resolveTabId, type TabId } from './tabs';
 	import { showUtFileStat } from './ut-stat';
 	import { baseLocale, locales } from '$lib/paraglide/runtime';
 	import * as m from '$lib/paraglide/messages';
@@ -173,7 +175,27 @@
 	const RESEND_RING_C = 113.1;
 	const resendRingOffset = $derived(RESEND_RING_C * (1 - resendProgress.done / resendProgress.total));
 
-	let activeTab = $state<'site' | 'connections' | 'storage' | 'account' | 'observability'>('site');
+	// Tabs: ?tab= deep-links resolve REACTIVELY (the admin-wide key-expiry
+	// notice, SONA-114, links to ?tab=account), so a same-route navigation to a
+	// ?tab= URL still switches tabs. Clicking a tab button takes manual control
+	// and shallow-drops the stale param (replaceState is not a navigation, so
+	// afterNavigate below won't clear the manual pick); any real navigation
+	// hands control back to the URL.
+	let manualTab = $state<TabId | null>(null);
+	const activeTab = $derived(
+		manualTab ?? resolveTabId($page.url.searchParams.get('tab'), data.observabilityEnabled)
+	);
+	afterNavigate(() => {
+		manualTab = null;
+	});
+	function selectTab(tab: TabId) {
+		manualTab = tab;
+		if ($page.url.searchParams.has('tab')) {
+			const url = new URL($page.url);
+			url.searchParams.delete('tab');
+			replaceState(url, {});
+		}
+	}
 
 	// Usage bar reflects the ACTIVE provider. R2 has no simple usage API, so we use
 	// the DB-tracked total (every image is on the active store) against the 10GB free tier.
@@ -285,12 +307,12 @@
 			<h1>{m.admin_nav_settings()}</h1>
 		</div>
 		<nav class="settings-tabnav">
-			<button type="button" class:active={activeTab === 'site'} onclick={() => (activeTab = 'site')}>{m.admin_settings_tab_site()}</button>
-			<button type="button" class:active={activeTab === 'connections'} onclick={() => (activeTab = 'connections')}>{m.admin_settings_tab_connections()}</button>
-			<button type="button" class:active={activeTab === 'storage'} onclick={() => (activeTab = 'storage')}>{m.admin_settings_tab_storage()}</button>
-			<button type="button" class:active={activeTab === 'account'} onclick={() => (activeTab = 'account')}>{m.admin_settings_tab_account()}</button>
+			<button type="button" class:active={activeTab === 'site'} aria-current={activeTab === 'site' ? 'true' : undefined} onclick={() => selectTab('site')}>{m.admin_settings_tab_site()}</button>
+			<button type="button" class:active={activeTab === 'connections'} aria-current={activeTab === 'connections' ? 'true' : undefined} onclick={() => selectTab('connections')}>{m.admin_settings_tab_connections()}</button>
+			<button type="button" class:active={activeTab === 'storage'} aria-current={activeTab === 'storage' ? 'true' : undefined} onclick={() => selectTab('storage')}>{m.admin_settings_tab_storage()}</button>
+			<button type="button" class:active={activeTab === 'account'} aria-current={activeTab === 'account' ? 'true' : undefined} onclick={() => selectTab('account')}>{m.admin_settings_tab_account()}</button>
 			{#if data.observabilityEnabled}
-				<button type="button" class:active={activeTab === 'observability'} onclick={() => (activeTab = 'observability')}>{m.admin_settings_tab_observability()}</button>
+				<button type="button" class:active={activeTab === 'observability'} aria-current={activeTab === 'observability' ? 'true' : undefined} onclick={() => selectTab('observability')}>{m.admin_settings_tab_observability()}</button>
 			{/if}
 		</nav>
 	</div>
@@ -828,7 +850,19 @@
 {#if data.supporterKey?.state === 'valid'}
 	<section class="security-section" data-tab="account">
 		<h2>{m.admin_settings_supporter_heading()}</h2>
-		<div class="key-eyebrow">{m.admin_settings_supporter_valid_until({ date: data.supporterKey.validUntil })}</div>
+		<div class="key-eyebrow">
+			{m.admin_settings_supporter_valid_until({ date: data.supporterKey.validUntil })}
+			{#if data.supporterKey.expiringSoon}
+				· <span class="days-left">{data.supporterKey.daysRemaining <= 1
+					? m.admin_settings_supporter_expires_today()
+					: m.admin_settings_supporter_days_left({ days: data.supporterKey.daysRemaining })}</span>
+			{/if}
+		</div>
+		{#if data.supporterKey.expiringSoon}
+			<!-- Action only — the eyebrow above already carries the countdown, so the
+			     nudge doesn't repeat it. -->
+			<p class="nudge-line">{m.admin_settings_supporter_expiring_pre()}<a class="link-inline" href="https://sona.fast/supporter-key" target="_blank" rel="noopener noreferrer">sona.fast/supporter-key<span class="sr-only"> {m.link_opens_new_tab()}</span></a>{m.admin_settings_supporter_expiring_post()}</p>
+		{/if}
 		{#if data.earlyAccess.length}
 			<p class="status-line">{m.admin_settings_supporter_early_active({ features: earlyActiveText })}</p>
 		{:else}
@@ -1608,12 +1642,22 @@
 		margin-bottom: 14px;
 		max-width: 62ch;
 	}
-	.lapsed-line {
+	/* nudge-line (expiring soon, SONA-114) shares the lapsed-line voice: same
+	   weight so "act on this" reads consistently across the two states. */
+	.lapsed-line,
+	.nudge-line {
 		font-size: 14px;
 		color: var(--foreground);
 		line-height: 1.55;
 		margin-bottom: 16px;
 		max-width: 62ch;
+	}
+	/* Countdown on the eyebrow — warn, not destructive (the key still works)
+	   and not attention (that tracks --primary, which would make the warning
+	   read as brand accent in the default dark theme). --status-warn is
+	   family-stable amber in all themes and AA on the card. */
+	.days-left {
+		color: var(--status-warn);
 	}
 	/* Stored key on a raised, higher-contrast panel (var(--secondary) stands in
 	   for the mock's --raised, which isn't a shared token). */
@@ -1658,6 +1702,18 @@
 	.link-inline:focus-visible {
 		outline: 2px solid var(--foreground);
 		outline-offset: 2px;
+	}
+	/* Screen-reader-only "(opens in a new tab)" on the external nudge link. */
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
 	}
 	/* Destructive on text only — matches the app's form errors. */
 	.field-error {
