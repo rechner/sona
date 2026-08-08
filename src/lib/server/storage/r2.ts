@@ -1,6 +1,7 @@
 import type { R2Bucket } from '@cloudflare/workers-types';
 import { ZeroKeepError } from './types';
 import { bufferStream } from './buffer';
+import { fixedLengthStreamCtor } from './fixed-length';
 import type { StorageProvider, PutInput, PutResult, DeleteOrphansOptions } from './types';
 
 export interface R2Options {
@@ -25,20 +26,57 @@ export class R2Storage implements StorageProvider {
 		this.#base = opts.publicBase.replace(/\/+$/, '');
 	}
 
-	async put({ suggestedKey, body, contentType }: PutInput): Promise<PutResult> {
+	async put({ suggestedKey, body, contentType, size }: PutInput): Promise<PutResult> {
 		const key = suggestedKey.replace(/^\/+/, '');
-		// R2 requires a known content length; a raw ReadableStream (download/upload
-		// body) doesn't have one, so buffer streams before storing. The buffer is
-		// byte-capped (M8) so a large source can't OOM the isolate. ArrayBuffer /
-		// Uint8Array already have a length and pass through.
-		const data = body instanceof ReadableStream ? await bufferStream(body) : body;
 		// Stored images are immutable (content-addressed by a random-uuid key), so
 		// give them an explicit 1-day cache instead of relying on Cloudflare's 4h
 		// zone default. CF Image Transformations inherit this, so resized thumbnails
 		// cache for a day too rather than regenerating every 4h.
-		await this.#bucket.put(key, data as ArrayBuffer | Uint8Array, {
-			httpMetadata: { contentType, cacheControl: 'public, max-age=86400' }
-		});
+		const httpMetadata = { contentType, cacheControl: 'public, max-age=86400' };
+
+		// R2 requires a known content length. With a declared `size`, pipe the
+		// stream through FixedLengthStream so nothing is materialized and a body
+		// that doesn't match the declaration fails the put. The buffering branch
+		// below is workerd-unreachable (FixedLengthStream always exists there):
+		// it serves Node dev/tests, and for a sized stream it buffers up to the
+		// caller-declared size — a lying source is caught by the length check.
+		// A stream with NO size buffers under MAX_BUFFER_BYTES (M8) instead.
+		const FixedLengthStream = fixedLengthStreamCtor();
+		if (body instanceof ReadableStream && size !== undefined && FixedLengthStream) {
+			const fixed = new FixedLengthStream(size);
+			const pump = body.pipeTo(fixed.writable);
+			// Await both: the put consumes the readable side, and a pump failure
+			// (size mismatch, source error) must reject the call, not float.
+			// Failure modes: an under-length or errored source leaves the key
+			// absent, but an OVER-length source — put() still rejects — leaves a
+			// truncated object of exactly the declared size at the key, replacing
+			// whatever was there. No cleanup delete, deliberately: every caller
+			// passes an authoritative size (File.size or a fetch-bounded
+			// Content-Length), so an over-length source is unreachable today; if
+			// it ever happened the leftover is an unreferenced orphan the sweep
+			// reclaims (the rejection means no DB row points at it), whereas a
+			// delete here could destroy a live object under migrate's
+			// deterministic keys.
+			// The cast bridges the DOM ReadableStream type to workers-types' (the
+			// same object at runtime; only the .d.ts lineages differ).
+			await Promise.all([
+				this.#bucket.put(key, fixed.readable as unknown as Parameters<R2Bucket['put']>[1], {
+					httpMetadata
+				}),
+				pump
+			]);
+			return { url: `${this.#base}/${key}` };
+		}
+		let data: ArrayBuffer | Uint8Array;
+		if (body instanceof ReadableStream) {
+			data = await bufferStream(body, size);
+			if (size !== undefined && data.length !== size) {
+				throw new Error(`r2: body was ${data.length} bytes but ${size} were declared`);
+			}
+		} else {
+			data = body;
+		}
+		await this.#bucket.put(key, data, { httpMetadata });
 		return { url: `${this.#base}/${key}` };
 	}
 

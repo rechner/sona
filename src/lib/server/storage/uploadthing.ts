@@ -1,22 +1,198 @@
 import { UTApi } from 'uploadthing/server';
+// The SDK's own version, sent as x-uploadthing-version on the ingest PUT to
+// match what UTApi.uploadFiles sends (uploadthing/server re-imports this same
+// value but doesn't re-export it).
+import { version as UT_SDK_VERSION } from 'uploadthing/package.json';
+import { generateKey, generateSignedURL } from '@uploadthing/shared';
+import * as Micro from 'effect/Micro';
+import * as Redacted from 'effect/Redacted';
 import { ZeroKeepError } from './types';
+import { fixedLengthStreamCtor } from './fixed-length';
 import type { StorageProvider, PutInput, PutResult, DeleteOrphansOptions } from './types';
+
+/**
+ * The relevant fields of the UPLOADTHING_TOKEN payload (base64 JSON). The wire
+ * token carries { apiKey, appId, regions: string[], ingestHost? } — the SDK's
+ * own schema — but only the first region is ever used, so parsing keeps just it.
+ */
+interface ParsedToken {
+	apiKey: string;
+	appId: string;
+	region: string;
+	ingestHost: string;
+}
+
+/** Response body of a successful ingest PUT (the subset we use). */
+interface IngestUploadResponse {
+	ufsUrl?: string;
+	error?: unknown;
+}
+
+// Token-derived values that end up inside the ingest URL must be plain DNS-name
+// shapes — anything else (credentials, ports, paths) could redirect the signed
+// upload to a host the token author chose.
+const HOST_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/i;
+
+// Ceiling on the whole ingest PUT. Without it, a stalled UploadThing endpoint
+// holds the caller's request open until the platform kills the isolate.
+// Generous on purpose: worker-to-ingest moves a 50 MB model in well under a
+// minute on any sane path, so five minutes only ever fires on a genuine stall.
+const INGEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 export class UploadThingStorage implements StorageProvider {
 	readonly id = 'uploadthing' as const;
 	#api: UTApi;
+	#rawToken: string;
 
 	constructor(opts: { token: string }) {
 		this.#api = new UTApi({ token: opts.token });
+		this.#rawToken = opts.token;
 	}
 
-	async put({ body, contentType, filename }: PutInput): Promise<PutResult> {
-		// UploadThing needs a File, so a stream is buffered here.
+	async put({ body, contentType, filename, size }: PutInput): Promise<PutResult> {
+		// With a declared size, upload the stream via UploadThing's documented
+		// presigned-ingest protocol instead of materializing it — UTApi has no
+		// streaming API (uploadFiles takes a Blob), but the wire protocol is a
+		// plain HTTP PUT: https://docs.uploadthing.com/uploading-files
+		if (body instanceof ReadableStream && size !== undefined) {
+			return this.#putStream(body, size, contentType, filename);
+		}
+		// Buffered path: small bodies and streams of unknown length. Callers cap
+		// unknown-length streams (MAX_BUFFER_BYTES) before they get here.
 		const part = body instanceof ReadableStream ? await new Response(body).arrayBuffer() : body;
 		const file = new File([part as BlobPart], filename, { type: contentType });
 		const res = await this.#api.uploadFiles(file);
 		if (res.error) throw new Error(`UploadThing upload failed: ${res.error.message}`);
 		return { url: res.data.ufsUrl };
+	}
+
+	/**
+	 * Stream `body` to UploadThing without buffering it: sign an ingest URL
+	 * locally (no API round-trip — generateKey/generateSignedURL are the SDK's
+	 * own public helpers), then PUT the bytes as the same multipart shape the
+	 * official clients send. Content-Length is exact, so the whole request is a
+	 * single fixed-size pass and the isolate only ever holds one chunk.
+	 */
+	async #putStream(
+		body: ReadableStream<Uint8Array>,
+		size: number,
+		contentType: string,
+		filename: string
+	): Promise<PutResult> {
+		// The content type is interpolated into a multipart header line below;
+		// only printable ASCII can't smuggle CR/LF (or raw bytes) into the framing.
+		if (!/^[\x20-\x7e]+$/.test(contentType)) {
+			throw new Error(`uploadthing: content type contains unsafe characters: ${JSON.stringify(contentType)}`);
+		}
+		const { apiKey, appId, region, ingestHost } = this.#token();
+		const key = await Micro.runPromise(
+			generateKey({ name: filename, size, type: contentType, lastModified: Date.now() }, appId)
+		);
+		const url = await Micro.runPromise(
+			generateSignedURL(`https://${region}.${ingestHost}/${key}`, Redacted.make(apiKey), {
+				// x-ut-slug is only for client route uploads; server-side uploads omit
+				// it. x-ut-acl is deliberately undefined (generateSignedURL skips
+				// null/undefined data values): the app's default ACL then applies,
+				// matching what UTApi.uploadFiles sends.
+				data: {
+					'x-ut-identifier': appId,
+					'x-ut-file-name': filename,
+					'x-ut-file-size': size,
+					'x-ut-file-type': contentType,
+					'x-ut-content-disposition': 'inline',
+					'x-ut-acl': undefined
+				}
+			})
+		);
+		// Multipart framing around the raw stream, mirroring the SDK's
+		// `formData.append('file', file)` — built by hand so the file bytes stay
+		// a stream. Quotes, backslashes and CR/LF are stripped from the filename
+		// to keep the Content-Disposition header well-formed (the stored name
+		// comes from x-ut-file-name above, signed and percent-encoded separately).
+		const boundary = `----sona-${crypto.randomUUID()}`;
+		const safeName = filename.replace(/["\\\r\n]/g, '_');
+		const encoder = new TextEncoder();
+		const head = encoder.encode(
+			`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeName}"\r\n` +
+				`Content-Type: ${contentType}\r\n\r\n`
+		);
+		const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+		const total = head.length + size + tail.length;
+
+		const framed = frameMultipart(head, body, size, tail);
+		// workerd silently drops a manually-set content-length header on a plain
+		// ReadableStream body and sends chunked encoding instead — only a
+		// FixedLengthStream body carries a real Content-Length there. Node
+		// (dev/tests) has no FixedLengthStream but honours the header below.
+		const FixedLengthStream = fixedLengthStreamCtor();
+		const fixed = FixedLengthStream ? new FixedLengthStream(total) : undefined;
+		const pump = fixed ? framed.pipeTo(fixed.writable) : undefined;
+
+		// Await both: fetch consumes the readable side, and a pump failure (source
+		// error, wrong length) must reject the call, not float.
+		const [res] = await Promise.all([
+			fetch(url, {
+				method: 'PUT',
+				headers: {
+					'content-type': `multipart/form-data; boundary=${boundary}`,
+					// Exact total: declared file size plus the fixed framing. A body
+					// that doesn't match fails the request instead of storing garbage.
+					'content-length': String(total),
+					// The ingest protocol is resumable; a fresh upload starts at 0.
+					range: 'bytes=0-',
+					'x-uploadthing-version': UT_SDK_VERSION
+				},
+				body: fixed ? fixed.readable : framed,
+				// Aborting the fetch also cancels its body stream, which unwinds the
+				// pump — so one signal bounds the whole transfer.
+				signal: AbortSignal.timeout(INGEST_TIMEOUT_MS),
+				// Node (dev/tests) requires half-duplex for stream bodies; workerd
+				// streams uploads natively and ignores the flag.
+				...({ duplex: 'half' } as RequestInit)
+			}),
+			pump
+		]);
+		if (!res.ok) {
+			const detail = await res.text().catch(() => '');
+			throw new Error(`UploadThing ingest PUT failed: ${res.status} ${detail}`.trim());
+		}
+		const json = (await res.json()) as IngestUploadResponse;
+		if (!json.ufsUrl) {
+			throw new Error(
+				`UploadThing ingest PUT returned no ufsUrl${json.error ? `: ${String(json.error)}` : ''}`
+			);
+		}
+		return { url: json.ufsUrl };
+	}
+
+	/** Parse UPLOADTHING_TOKEN lazily (only the streaming path needs it). */
+	#token(): ParsedToken {
+		let parsed: Partial<ParsedToken> & { regions?: unknown };
+		try {
+			parsed = JSON.parse(
+				new TextDecoder().decode(Uint8Array.from(atob(this.#rawToken), (c) => c.charCodeAt(0)))
+			);
+		} catch {
+			throw new Error(
+				'UPLOADTHING_TOKEN is not a base64 JSON token; cannot construct a presigned upload URL'
+			);
+		}
+		const { apiKey, appId } = parsed;
+		const region = Array.isArray(parsed.regions) ? parsed.regions[0] : undefined;
+		const ingestHost =
+			typeof parsed.ingestHost === 'string' ? parsed.ingestHost : 'ingest.uploadthing.com';
+		if (
+			typeof apiKey !== 'string' ||
+			typeof appId !== 'string' ||
+			typeof region !== 'string' ||
+			!HOST_RE.test(region) ||
+			!HOST_RE.test(ingestHost)
+		) {
+			throw new Error(
+				'UPLOADTHING_TOKEN is missing or malformed (apiKey/appId/regions/ingestHost); cannot construct a presigned upload URL'
+			);
+		}
+		return { apiKey, appId, region, ingestHost };
 	}
 
 	async deleteByUrl(url: string): Promise<void> {
@@ -60,4 +236,41 @@ export class UploadThingStorage implements StorageProvider {
 		const m = url.match(/\/f\/([^/?#]+)/);
 		return m ? m[1] : null;
 	}
+}
+
+/**
+ * Frame a byte stream as a single multipart/form-data part without buffering:
+ * `head`, then the source chunks (backpressure and cancellation propagate
+ * through the TransformStream), then `tail`. Errors the stream as soon as the
+ * source yields more than `size` bytes — in Node an over-long body would
+ * otherwise stall the fetch forever once content-length bytes have been sent
+ * (workerd's FixedLengthStream catches the mismatch on its own) — and on
+ * flush when it yielded fewer, so an undershoot rejects with the real cause
+ * instead of a transport-level length error.
+ */
+function frameMultipart(
+	head: Uint8Array,
+	body: ReadableStream<Uint8Array>,
+	size: number,
+	tail: Uint8Array
+): ReadableStream<Uint8Array> {
+	let seen = 0;
+	return body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			start: (c) => c.enqueue(head),
+			transform(chunk, c) {
+				seen += chunk.length;
+				if (seen > size) {
+					throw new Error(`uploadthing: body exceeded the declared ${size} bytes`);
+				}
+				c.enqueue(chunk);
+			},
+			flush(c) {
+				if (seen !== size) {
+					throw new Error(`uploadthing: body was ${seen} bytes but ${size} were declared`);
+				}
+				c.enqueue(tail);
+			}
+		})
+	);
 }

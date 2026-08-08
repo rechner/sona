@@ -24,7 +24,12 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 	const settings = await getSettings(db, { fresh: true });
 	const storage = getStorage(platform?.env, settings);
 
-	// Cap the stored size (M8) so a huge upload can't OOM the isolate while buffering.
+	// Size cap for this image endpoint. It still bounds isolate memory here:
+	// request.formData() above fully materializes the File before put() runs —
+	// streaming (SONA-136) only avoids a second copy. A truly large-body
+	// endpoint (e.g. VR avatar models) must read request.body directly instead
+	// of formData(), and sets its own cap. >10 MB raster images also have no
+	// product use, and the cap keeps fork storage bills predictable.
 	if (file.size > MAX_BUFFER_BYTES) {
 		error(413, `File too large: ${file.size} bytes. Max ${MAX_BUFFER_BYTES}.`);
 	}
@@ -44,6 +49,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 		error(415, 'File contents do not match an allowed image type.');
 	}
 	const ext = extFromContentType(contentType);
+	// Store the normalized value the allowlist actually matched (parameters
+	// stripped, lowercased) so what was validated is what is used downstream.
+	const storedType = contentType.split(';')[0].trim().toLowerCase();
 	const key = `${folder}/${crypto.randomUUID()}.${ext}`;
 
 	// Observability (issue #6): record upload health (provider-agnostic — works for
@@ -51,7 +59,13 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 	// re-throws unchanged after being sampled.
 	let putResult;
 	try {
-		putResult = await storage.put({ suggestedKey: key, body: file.stream(), contentType, filename: file.name });
+		putResult = await storage.put({
+			suggestedKey: key,
+			body: file.stream(),
+			size: file.size,
+			contentType: storedType,
+			filename: file.name
+		});
 	} catch (e) {
 		schedule(platform, recordUpload(db, false, {
 			status: 500,
