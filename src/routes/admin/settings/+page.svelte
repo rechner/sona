@@ -7,7 +7,7 @@
 	import CopyCommand from '$lib/components/CopyCommand.svelte';
 	import CloudflareSetupDialog from '$lib/components/CloudflareSetupDialog.svelte';
 	import { toast } from '$lib/toast.svelte';
-	import { BACKUP_FILENAME_BASE } from '$lib/config';
+	import { BACKUP_FILENAME_BASE, R2_FREE_TIER_BYTES } from '$lib/config';
 	import { normalizeHex } from '$lib/color-hex';
 	import { MAX_SONA_COLORS, mergeSuggestions, paletteHas } from '$lib/palette-merge';
 	import { RefreshCw, Loader2, Mail, AlertTriangle, Check, X, Pipette } from 'lucide-svelte';
@@ -17,6 +17,7 @@
 	import { resolveTabId, type TabId } from './tabs';
 	import { showUtFileStat } from './ut-stat';
 	import { baseLocale, locales } from '$lib/paraglide/runtime';
+	import { earlyAccessLabel } from '$lib/early-access-label';
 	import * as m from '$lib/paraglide/messages';
 
 	// Endonyms for the email-language options — a language name reads the same
@@ -153,9 +154,11 @@
 	}
 	// Localized "in early access right now" list, joined for the status line. Empty
 	// until a pilot feature is registered, in which case the "nothing" line shows.
+	// Each flag renders its localized display label (earlyAccessLabel resolves the
+	// by-convention message id through paraglide), never the raw flag slug.
 	const earlyActiveText = $derived(
 		data.earlyAccess
-			.map((e) => m.admin_settings_supporter_early_item({ feature: e.flag, date: e.gaDate }))
+			.map((e) => m.admin_settings_supporter_early_item({ feature: earlyAccessLabel(e.flag), date: e.gaDate }))
 			.join(m.admin_settings_supporter_early_join())
 	);
 	let showResendSetup = $state(false);
@@ -199,10 +202,9 @@
 
 	// Usage bar reflects the ACTIVE provider. R2 has no simple usage API, so we use
 	// the DB-tracked total (every image is on the active store) against the 10GB free tier.
-	const R2_FREE_LIMIT = 10 * 1024 * 1024 * 1024;
 	const activeUsage = $derived(
 		data.settings.storageProvider === 'r2'
-			? { label: 'Cloudflare R2', used: data.totalSize, limit: R2_FREE_LIMIT }
+			? { label: 'Cloudflare R2', used: data.totalSize, limit: R2_FREE_TIER_BYTES }
 			: data.utUsage
 				? { label: 'UploadThing', used: data.utUsage.usedBytes, limit: data.utUsage.limitBytes }
 				: null

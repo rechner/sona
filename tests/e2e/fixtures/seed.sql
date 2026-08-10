@@ -59,6 +59,35 @@ VALUES
 INSERT OR REPLACE INTO tags (id, name, created_at) VALUES (1, 'reference', '2026-07-01T00:00:00.000Z');
 INSERT OR REPLACE INTO image_tags (image_id, tag_id) VALUES (3, 1);
 
+-- VR avatar fixtures for the vr-avatar spec (SONA-124). One character to
+-- satisfy the FK, one PUBLISHED avatar with a self-hosted model whose license
+-- is restrictive (all-rights-reserved: the download route must 403 even with
+-- downloadable=1 AND a recorded permission source — the flag and the grant
+-- can't override the license, and the model bytes are never fetched so no R2
+-- object is needed; the recorded source also keeps the row saveable through
+-- the admin edit form, which 400s on downloadable-without-source), and one
+-- UNPUBLISHED draft that must stay invisible publicly. The model URL is a
+-- same-origin placeholder path, like the image fixtures — the spec never
+-- loads the 3D view.
+INSERT OR REPLACE INTO characters (id, name, created_at)
+VALUES (1, 'Taro', '2026-07-01T00:00:00.000Z');
+INSERT OR REPLACE INTO vr_avatars
+  (id, slug, name, character_id, model_url, model_format, model_size_bytes, poster_image_id,
+   external_url, license, permission_source, downloadable, nsfw, published, description, created_at)
+VALUES
+  (1, 'e2e-avatar', 'E2E VR Avatar', 1, '/img/vr-models/e2e-avatar.vrm', 'vrm', 1234567, 1,
+   NULL, 'all-rights-reserved', 'e2e fixture grant', 1, 0, 1, NULL, '2026-07-01T00:00:00.000Z'),
+  (2, 'e2e-draft', 'E2E VR Draft', 1, NULL, NULL, NULL, NULL,
+   NULL, NULL, NULL, 0, 0, 0, NULL, '2026-07-02T00:00:00.000Z');
+INSERT OR REPLACE INTO avatar_platforms (avatar_id, platform) VALUES (1, 'vrchat');
+
+-- Showcase media for avatar 1 (SONA-124 SP1): one image + one clip so the
+-- public detail page's media strip renders (poster thumb + these two). URLs
+-- are same-origin placeholders that 404 harmlessly, like the image fixtures.
+INSERT OR REPLACE INTO avatar_media (avatar_id, kind, url, width, height, position) VALUES
+  (1, 'image', '/e2e/vr-media-shot.png', 900, 700, 0),
+  (1, 'video', '/e2e/vr-media-clip.webm', 640, 360, 1);
+
 -- Tier-A visitor rollups for the observability spec (#193): enough pageview /
 -- device / referrer / country counters (dated today, inside the dashboard
 -- window) that /admin/observability renders every percentage-bar list with a

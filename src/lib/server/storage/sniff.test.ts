@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sniffImageType } from './sniff';
+import { sniffImageType, isWebmHead } from './sniff';
 import { isAllowedImageType } from './index';
 
 const enc = new TextEncoder();
@@ -64,5 +64,59 @@ describe('sniffImageType', () => {
 	it('accepts real raster bytes through the same allowlist gate', () => {
 		expect(isAllowedImageType(sniffImageType(PNG))).toBe(true);
 		expect(isAllowedImageType(sniffImageType(WEBP))).toBe(true);
+	});
+});
+
+describe('isWebmHead (SONA-124 showcase clips)', () => {
+	// EBML/Matroska magic: 1A 45 DF A3.
+	// EBML magic + a DocType of 'webm' — the magic alone is Matroska-family,
+	// not webm-specific (see the DocType discrimination describe below).
+	const WEBM = new Uint8Array([
+		0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6d
+	]);
+
+	it('detects the EBML magic with a webm DocType', () => {
+		expect(isWebmHead(WEBM)).toBe(true);
+	});
+
+	it('rejects HTML, raster bytes, truncated heads, and empty input', () => {
+		expect(isWebmHead(enc.encode('<!DOCTYPE html><script>alert(1)</script>'))).toBe(false);
+		expect(isWebmHead(PNG)).toBe(false);
+		expect(isWebmHead(new Uint8Array([0x1a, 0x45]))).toBe(false);
+		expect(isWebmHead(new Uint8Array([]))).toBe(false);
+	});
+
+	it('is NOT consulted by sniffImageType — image call sites cannot start accepting video', () => {
+		expect(sniffImageType(WEBM)).toBeNull();
+		expect(isAllowedImageType(sniffImageType(WEBM))).toBe(false);
+	});
+});
+
+describe('isWebmHead — DocType discrimination (SONA-124)', () => {
+	// Structurally valid EBML header, as real muxers write it: magic, header
+	// size VINT, EBMLVersion child, then the DocType element (id 42 82).
+	function ebmlHead(doctype: string, trailer: number[] = []): Uint8Array {
+		const dt = [...new TextEncoder().encode(doctype)];
+		const body = [0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x80 | dt.length, ...dt, ...trailer];
+		return new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x80 | body.length, ...body]);
+	}
+
+	it('accepts an EBML head whose DocType is webm', () => {
+		expect(isWebmHead(ebmlHead('webm'))).toBe(true);
+	});
+
+	it('rejects a Matroska head — EBML magic alone is not webm', () => {
+		expect(isWebmHead(ebmlHead('matroska'))).toBe(false);
+	});
+
+	it("rejects 'webm' bytes that sit OUTSIDE the DocType element", () => {
+		// A Matroska DocType with the ASCII bytes 'webm' parked in a trailing
+		// Void element (id EC) — the old byte scan accepted exactly this shape.
+		const smuggled = ebmlHead('matroska', [0xec, 0x84, 0x77, 0x65, 0x62, 0x6d]);
+		expect(isWebmHead(smuggled)).toBe(false);
+	});
+
+	it('rejects a header whose DocType element is truncated by the sniff window', () => {
+		expect(isWebmHead(ebmlHead('webm').slice(0, 10))).toBe(false);
 	});
 });

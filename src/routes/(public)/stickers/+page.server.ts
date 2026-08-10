@@ -4,6 +4,7 @@ import { emojiForKeyword, containsEmoji } from '$lib/server/emoji-keywords';
 import { getMode } from '$lib/server/furtrack';
 import { stickerPacks, fursuitPhotos } from '$lib/server/db/schema';
 import { inArray, sql } from 'drizzle-orm';
+import { vrTabEnabled } from '$lib/server/vr-gate';
 import type { PageServerLoad } from './$types';
 
 // Cap free-text length before keyword expansion (cheap DoS guard).
@@ -25,9 +26,13 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		getMode(platform!.env) !== 'off' &&
 		((await db.select({ n: sql<number>`COUNT(*)` }).from(fursuitPhotos).get())?.n ?? 0) > 0;
 
-	const [topEmojiList, stickerArtists] = await Promise.all([
+	// VR Avatars pill mirrors the gallery's rule (shared vrTabEnabled probe):
+	// visible only once a published avatar exists, so the tab bars never
+	// disagree. Rides the Promise.all — this is a hot public page.
+	const [topEmojiList, stickerArtists, vrEnabled] = await Promise.all([
 		topEmojis(db),
-		listStickerArtists(db)
+		listStickerArtists(db),
+		vrTabEnabled(db)
 	]);
 
 	if (hasFilter) {
@@ -71,6 +76,7 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 			topEmojis: topEmojiList,
 			artists: stickerArtists,
 			fursuitEnabled,
+			vrEnabled,
 			filters: { emoji: emojiParam, artist: artistParam, q }
 		};
 	}
@@ -83,6 +89,7 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		topEmojis: topEmojiList,
 		artists: stickerArtists,
 		fursuitEnabled,
+		vrEnabled,
 		filters: { emoji: '', artist: '', q: '' }
 	};
 };

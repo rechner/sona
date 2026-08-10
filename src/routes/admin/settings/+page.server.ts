@@ -24,6 +24,10 @@ import {
 	stickerPacks,
 	stickers,
 	stickerEmojis,
+	vrAvatars,
+	avatarCredits,
+	avatarMedia,
+	avatarPlatforms,
 	sessions,
 	siteSettings
 } from '$lib/server/db/schema';
@@ -593,6 +597,10 @@ export const actions = {
 			allStickerPacks,
 			allStickers,
 			allStickerEmojis,
+			allVrAvatars,
+			allAvatarCredits,
+			allAvatarMedia,
+			allAvatarPlatforms,
 			settings
 		] = await Promise.all([
 			db.select().from(images),
@@ -607,6 +615,10 @@ export const actions = {
 			db.select().from(stickerPacks),
 			db.select().from(stickers),
 			db.select().from(stickerEmojis),
+			db.select().from(vrAvatars),
+			db.select().from(avatarCredits),
+			db.select().from(avatarMedia),
+			db.select().from(avatarPlatforms),
 			getSettings(db)
 		]);
 
@@ -627,7 +639,11 @@ export const actions = {
 			fursuitPhotos: allFursuitPhotos,
 			stickerPacks: allStickerPacks,
 			stickers: allStickers,
-			stickerEmojis: allStickerEmojis
+			stickerEmojis: allStickerEmojis,
+			vrAvatars: allVrAvatars,
+			avatarCredits: allAvatarCredits,
+			avatarMedia: allAvatarMedia,
+			avatarPlatforms: allAvatarPlatforms
 		};
 
 		return { success: true, export: JSON.stringify(backup, null, 2) };
@@ -691,7 +707,12 @@ export const actions = {
 		const settings = await getSettings(db);
 		const imageCount = (await db.select({ imageUrl: images.imageUrl }).from(images)).length;
 
-		// Delete from D1
+		// Delete from D1. VR avatars go FIRST: vr_avatars.character_id and
+		// avatar_credits.artist_id reference characters/artists without cascade,
+		// so with a VR row present the characters/artists deletes below would
+		// fail their FK checks. The avatar delete cascades its child tables
+		// (credits, media, platforms).
+		await db.delete(vrAvatars);
 		await db.delete(imageTags);
 		await db.delete(imageCharacters);
 		await db.delete(images);

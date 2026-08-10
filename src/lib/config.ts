@@ -16,6 +16,15 @@ import { dev } from '$app/environment';
 export const APP_NAME = 'Sona';
 
 /**
+ * 10 MB: the buffered-upload cap. Comfortably above any real artwork/fursuit
+ * photo or Telegram sticker, while far below the isolate memory ceiling.
+ * Lives here (client-safe) because the admin media picker pre-checks it before
+ * sending a byte; the server side re-exports it as
+ * $lib/server/storage/buffer's MAX_BUFFER_BYTES and enforces it for real.
+ */
+export const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+
+/**
  * Admin session cookie name. Read in `hooks.server.ts` / `auth.ts` before any
  * DB access, so it must be a build-time constant rather than a setting.
  *
@@ -48,6 +57,13 @@ export const GALLERY_VIEW_STORAGE_KEY = 'sona-gallery-view';
 
 /** Base filename for the admin settings JSON backup export. */
 export const BACKUP_FILENAME_BASE = 'sona-backup';
+
+/**
+ * Cloudflare R2's free-tier storage allowance, shown against the DB-tracked
+ * usage total by the settings Storage tab and the admin VR storage line (R2
+ * has no simple usage API). One constant so the two gauges can't drift.
+ */
+export const R2_FREE_TIER_BYTES = 10 * 1024 * 1024 * 1024;
 
 /**
  * User-Agent sent on outbound third-party fetches (e.g. the FurTrack importer).

@@ -1,5 +1,6 @@
 import { getReadDb } from '$lib/server/db';
 import { images, artists, imageTags, tags, fursuitPhotos as fursuitPhotosTable } from '$lib/server/db/schema';
+import { vrTabEnabled } from '$lib/server/vr-gate';
 import { eq, desc, asc, like, sql, and, inArray, isNull, type SQL } from 'drizzle-orm';
 import { listPublicCharacterNames } from '$lib/server/characters';
 import { fursuitPhotoFromRow } from '$lib/server/fursuit-import';
@@ -187,9 +188,13 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		// Get all tags and characters for filters (artists already loaded above).
 		// Owner/site characters are excluded from the public character filter — see
 		// listPublicCharacterNames.
-		const [allTags, allCharacters] = await Promise.all([
+		// VR Avatars tab rides this Promise.all (shared vrTabEnabled probe): only
+		// rendered once at least one published avatar exists — with zero, the tab
+		// (and the empty /vr grid behind it) stays undiscoverable.
+		const [allTags, allCharacters, vrEnabled] = await Promise.all([
 			db.select({ name: tags.name }).from(tags).orderBy(tags.name),
-			listPublicCharacterNames(db)
+			listPublicCharacterNames(db),
+			vrTabEnabled(db)
 		]);
 
 		// Carry each artist's former names so the combobox can offer an old name
@@ -232,6 +237,7 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		return {
 			view,
 			fursuitEnabled,
+			vrEnabled,
 			fursuitPhotos,
 			fursuitPhotographers,
 			fursuitEvents,
