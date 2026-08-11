@@ -48,6 +48,24 @@ test('the ungated create form renders its fields, dropzones and credit control',
 	await expect(page.getByRole('checkbox', { name: 'Published' })).toBeAttached();
 });
 
+test("poster picker cells stay square even when the button's aspect-ratio is ignored", async ({ page }) => {
+	await adminLogin(page, PASSWORD);
+	await page.goto('/admin/vr/new');
+
+	// CI simulates an engine that ignores aspect-ratio on form controls (the
+	// override below) so the IMG's own aspect-ratio must hold the cell square;
+	// the sizing rationale lives on the .poster-option img rule in VrAvatarForm.
+	await page.waitForSelector('.poster-option img');
+	await page.addStyleTag({ content: '.poster-option { aspect-ratio: auto !important; }' });
+	// Assert the computed style directly so the check can't go vacuous if a
+	// future fixture happens to be square (or still loading) by coincidence.
+	await expect(page.locator('.poster-option img').first()).toHaveCSS('aspect-ratio', '1 / 1');
+	const box = await page.locator('.poster-option').first().boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.width).toBeGreaterThan(40);
+	expect(Math.abs(box!.width - box!.height)).toBeLessThan(1);
+});
+
 test('typing a name auto-suggests the slug until the slug is touched', async ({ page }) => {
 	await adminLogin(page, PASSWORD);
 	await page.goto('/admin/vr/new');

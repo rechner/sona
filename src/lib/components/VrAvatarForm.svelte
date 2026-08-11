@@ -1097,7 +1097,14 @@
 	}
 	.poster-option:hover { border-color: var(--border); }
 	.poster-option.selected { border-color: var(--primary); }
-	.poster-option img { width: 100%; height: 100%; object-fit: cover; display: block; }
+	/* The square comes from the IMG's aspect-ratio: engines that ignore
+	   aspect-ratio on form controls size the button from its content, so the
+	   old height:100% img fell back to its natural ratio — ragged cells once
+	   images load, near-zero slivers while lazy images sit unloaded or 404.
+	   The button's own aspect-ratio above is kept because the e2e squareness
+	   test disables exactly that rule to prove this img rule holds the square
+	   alone — deleting it would silently defuse the test. */
+	.poster-option img { width: 100%; height: auto; aspect-ratio: 1; object-fit: cover; display: block; }
 
 	.switch-rows { display: flex; flex-direction: column; gap: 14px; }
 	.switch-row { display: flex; align-items: center; gap: 12px; }
