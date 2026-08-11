@@ -3,6 +3,7 @@ import { images, artists, imageTags, tags } from '$lib/server/db/schema';
 import { eq, desc, and, notInArray, inArray, isNull, sql } from 'drizzle-orm';
 import { getSettings, settingsFallback } from '$lib/server/settings';
 import { probeArtContent, shareHasContent } from '$lib/server/presence';
+import { navGateFlags, PROBE_TIMEOUT_MS } from '$lib/server/nav-gating';
 import { withTimeout } from '$lib/server/timeout';
 import type { PageServerLoad } from './$types';
 
@@ -13,6 +14,13 @@ const READ_TIMEOUT_MS = 5000;
 export const load: PageServerLoad = async ({ platform, url }) => {
 	// Read-only path: route to a D1 read replica when replication is enabled.
 	const db = getReadDb(platform!.env.DB);
+
+	// Nav gating for the Header/MobileNav this page renders itself (+page@
+	// escapes the (public) layout, so that layout's probes never run here).
+	// Same fail-open posture as the path-card probes below; started BEFORE the
+	// settings await (and on the shared probe bound) so a degraded settings
+	// read doesn't stack its timeout window on top of the probes'.
+	const navFlags = navGateFlags(db, PROBE_TIMEOUT_MS);
 
 	// The homepage escapes the (public) layout (+page@), so that layout's
 	// settings load doesn't run here — read settings directly (cached
@@ -32,12 +40,15 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 			withTimeout(probeArtContent(db), READ_TIMEOUT_MS, true),
 			withTimeout(shareHasContent(db), READ_TIMEOUT_MS, true)
 		]);
+		const [stickersEnabled, collectionsEnabled] = await navFlags;
 		return {
 			settings,
 			recentImages: [],
 			mosaicImageUrls: [],
 			host: url.host,
-			pathPresence: { art, share }
+			pathPresence: { art, share },
+			stickersEnabled,
+			collectionsEnabled
 		};
 	}
 
@@ -133,12 +144,16 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		...randomMosaic.map((img) => img.imageUrl)
 	];
 
+	const [stickersEnabled, collectionsEnabled] = await navFlags;
+
 	return {
 		recentImages: imagesWithTags,
 		mosaicImageUrls,
 		settings,
 		host: url.host,
 		// The mosaic branch renders no path cards; true keeps the type uniform.
-		pathPresence: { art: true, share: true }
+		pathPresence: { art: true, share: true },
+		stickersEnabled,
+		collectionsEnabled
 	};
 };

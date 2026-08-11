@@ -1,7 +1,11 @@
 import { getReadDb } from '$lib/server/db';
-import { vrAvatars, avatarPlatforms, images, fursuitPhotos } from '$lib/server/db/schema';
-import { eq, desc, inArray, sql } from 'drizzle-orm';
+import { vrAvatars, avatarPlatforms, images } from '$lib/server/db/schema';
+import { eq, desc, inArray } from 'drizzle-orm';
 import { getMode } from '$lib/server/furtrack';
+import { fursuitPhotosExist } from '$lib/server/fursuit-import';
+import { stickerTabEnabled } from '$lib/server/stickers';
+import { PROBE_TIMEOUT_MS } from '$lib/server/nav-gating';
+import { withTimeout } from '$lib/server/timeout';
 import { externalSiteName, modelFormatLabel } from '$lib/vr';
 import type { PageServerLoad } from './$types';
 
@@ -40,10 +44,19 @@ export const load: PageServerLoad = async ({ platform }) => {
 	}
 
 	// Whether to show the Fursuit pill — gated on the FurTrack flag the same way
-	// the gallery and stickers pages are, so all tab bars agree.
-	const fursuitEnabled =
-		getMode(platform!.env) !== 'off' &&
-		((await db.select({ n: sql<number>`COUNT(*)` }).from(fursuitPhotos).get())?.n ?? 0) > 0;
+	// the gallery and stickers pages are, so all tab bars agree; the shared
+	// cached probe replaces the old per-request COUNT so a D1 stall can't hang
+	// this page. Both probes are wrapped AT CREATION (a rejection can never
+	// float unhandled) and awaited together. Fail directions: stickers open
+	// (dead link beats a hidden healthy section), fursuit closed (its target
+	// view silently falls back to artwork when the flag is off, so a
+	// false-open pill is a link to nowhere) — matching the gallery.
+	const stickersProbe = withTimeout(stickerTabEnabled(db), PROBE_TIMEOUT_MS, true);
+	const fursuitProbe =
+		getMode(platform!.env) !== 'off'
+			? withTimeout(fursuitPhotosExist(db), PROBE_TIMEOUT_MS, false)
+			: Promise.resolve(false);
+	const [stickersEnabled, fursuitEnabled] = await Promise.all([stickersProbe, fursuitProbe]);
 
 	const avatars = rows.map((r) => {
 		const hasModel = !!r.modelUrl;
@@ -62,5 +75,5 @@ export const load: PageServerLoad = async ({ platform }) => {
 		};
 	});
 
-	return { avatars, total: avatars.length, fursuitEnabled };
+	return { avatars, total: avatars.length, fursuitEnabled, stickersEnabled };
 };

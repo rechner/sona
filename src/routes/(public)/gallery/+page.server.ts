@@ -1,9 +1,11 @@
 import { getReadDb } from '$lib/server/db';
 import { images, artists, imageTags, tags, fursuitPhotos as fursuitPhotosTable } from '$lib/server/db/schema';
 import { vrTabEnabled } from '$lib/server/vr-gate';
+import { stickerTabEnabled } from '$lib/server/stickers';
+import { PROBE_TIMEOUT_MS } from '$lib/server/nav-gating';
 import { eq, desc, asc, like, sql, and, inArray, isNull, type SQL } from 'drizzle-orm';
 import { listPublicCharacterNames } from '$lib/server/characters';
-import { fursuitPhotoFromRow } from '$lib/server/fursuit-import';
+import { fursuitPhotoFromRow, fursuitPhotosExist } from '$lib/server/fursuit-import';
 import { getMode } from '$lib/server/furtrack';
 import { parseAliases } from '$lib/server/registry';
 import { getSettings } from '$lib/server/settings';
@@ -37,27 +39,23 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 	const filters = { search, tag: tagFilter, artist: artistFilter, character: characterFilter, sort };
 	const fursuitFilters = { photographer: photographerFilter, event: eventFilter };
 
-	// Degraded result served if D1 is too slow — an empty gallery that still
-	// renders the page shell and the user's active filters.
-	const degraded = {
-		view: 'artwork' as const,
-		fursuitEnabled: false,
-		fursuitPhotos: [] as FursuitPhoto[],
-		fursuitPhotographers: [] as string[],
-		fursuitEvents: [] as string[],
-		fursuitCapped: false,
-		fursuitFilters,
-		images: [] as Array<Record<string, unknown>>,
-		total: 0,
-		page,
-		totalPages: 0,
-		tags: [] as Array<{ name: string }>,
-		artists: [] as Array<{ name: string; formerly?: string[] }>,
-		characters: [] as Array<{ name: string }>,
-		filters,
-		formerName: null as { searched: string; current: string } | null,
-		degraded: true
-	};
+	// The VR/Stickers/Fursuit pill probes run OUTSIDE the gallery cap (started
+	// here, so they overlap build()'s reads): cheap SELECT-1s, cached
+	// per-isolate, so even the degraded fallback below keeps the REAL tab bar
+	// of a healthy-content fork — the .tabs suppression then only fires on
+	// genuine zero-content forks. VR/Stickers fail OPEN like the nav's; the
+	// fursuit probe fails CLOSED (fallback false) on purpose: a fail-open true
+	// would show a Fursuit tab pointing at a view the degraded page can't
+	// populate (its photos load inside build()), whereas a dead /vr or
+	// /stickers link still lands on a page that renders its own data.
+	// PROBE_TIMEOUT_MS (not the gallery cap): if build() REJECTS early,
+	// withTimeout serves the degraded fallback immediately — the trailing
+	// `await navProbes` must stay independently and tightly bounded.
+	const navProbes = Promise.all([
+		withTimeout(vrTabEnabled(db), PROBE_TIMEOUT_MS, true),
+		withTimeout(stickerTabEnabled(db), PROBE_TIMEOUT_MS, true),
+		withTimeout(fursuitPhotosExist(db), PROBE_TIMEOUT_MS, false)
+	]);
 
 	const build = async () => {
 		// Load artists (with former names) up front — used both to resolve the artist
@@ -188,14 +186,16 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		// Get all tags and characters for filters (artists already loaded above).
 		// Owner/site characters are excluded from the public character filter — see
 		// listPublicCharacterNames.
-		// VR Avatars tab rides this Promise.all (shared vrTabEnabled probe): only
-		// rendered once at least one published avatar exists — with zero, the tab
-		// (and the empty /vr grid behind it) stays undiscoverable.
-		const [allTags, allCharacters, vrEnabled] = await Promise.all([
+		// VR Avatars and Stickers tabs reuse the navProbes started before this
+		// build (shared vrTabEnabled / stickerTabEnabled probes): each is only
+		// rendered once at least one published row exists — with zero, the tab
+		// stays out of the bar while the section URL keeps rendering its honest
+		// empty state.
+		const [allTags, allCharacters] = await Promise.all([
 			db.select({ name: tags.name }).from(tags).orderBy(tags.name),
-			listPublicCharacterNames(db),
-			vrTabEnabled(db)
+			listPublicCharacterNames(db)
 		]);
+		const [vrEnabled, stickersEnabled, fursuitHasPhotos] = await navProbes;
 
 		// Carry each artist's former names so the combobox can offer an old name
 		// ("Kestrel · formerly KesForge") and stay reachable in-app.
@@ -204,14 +204,14 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 			return formerly.length ? { name: a.name, formerly } : { name: a.name };
 		});
 
-		// Fursuit Photos tab (FurTrack). Only active when the feature is enabled; the
-		// Fursuit Photos tab — reads imported, self-hosted photos from the DB. No
-		// FurTrack calls at request time; the toggle shows when photos exist.
-		// Gate on the FurTrack feature flag, not just the data: with mode 'off' the
-		// fursuit tab (and any already-imported photos) stay hidden until the feature
-		// is turned on, even if rows exist in the table.
-		const fursuitCount = (await db.select({ n: sql<number>`COUNT(*)` }).from(fursuitPhotosTable).get())?.n ?? 0;
-		const fursuitEnabled = getMode(platform!.env) !== 'off' && fursuitCount > 0;
+		// Fursuit Photos tab (FurTrack) — reads imported, self-hosted photos from
+		// the DB. No FurTrack calls at request time; the toggle shows when photos
+		// exist (the shared fursuitPhotosExist probe from navProbes above, so the
+		// healthy and degraded paths can't disagree). Gate on the FurTrack feature
+		// flag, not just the data: with mode 'off' the fursuit tab (and any
+		// already-imported photos) stay hidden until the feature is turned on,
+		// even if rows exist in the table.
+		const fursuitEnabled = getMode(platform!.env) !== 'off' && fursuitHasPhotos;
 		const view = fursuitEnabled && url.searchParams.get('view') === 'fursuit' ? 'fursuit' : 'artwork';
 
 		let fursuitPhotos: FursuitPhoto[] = [];
@@ -238,6 +238,7 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 			view,
 			fursuitEnabled,
 			vrEnabled,
+			stickersEnabled,
 			fursuitPhotos,
 			fursuitPhotographers,
 			fursuitEvents,
@@ -258,5 +259,46 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 		};
 	};
 
-	return withTimeout(build(), GALLERY_TIMEOUT_MS, degraded as Awaited<ReturnType<typeof build>>);
+	// Degraded result served if D1 is too slow — an empty gallery that still
+	// renders the page shell, the user's active filters, and (via the bounded
+	// navProbes above) the real content-gated pills. A plain literal on purpose
+	// (no cast): withTimeout's fallback parameter type-checks it against
+	// build()'s shape, so any drift is a compile error.
+	const degraded = {
+		view: 'artwork' as const,
+		fursuitEnabled: false,
+		stickersEnabled: false,
+		vrEnabled: false,
+		fursuitPhotos: [],
+		fursuitPhotographers: [],
+		fursuitEvents: [],
+		fursuitCapped: false,
+		fursuitFilters,
+		images: [],
+		total: 0,
+		page,
+		totalPages: 0,
+		tags: [],
+		artists: [],
+		characters: [],
+		filters,
+		formerName: null,
+		degraded: true
+	};
+	const result = await withTimeout(build(), GALLERY_TIMEOUT_MS, degraded);
+	if (!result.degraded) return result;
+	// Degraded path: swap in the real (bounded) pill probe results — the same
+	// predicate build() uses, so a fursuit-only fork keeps its tab bar too. And
+	// derive `view` exactly like build() does: with fursuitEnabled true, a
+	// degraded /gallery?view=fursuit must keep the Fursuit tab active (over the
+	// empty photo arrays above) rather than render a mismatched Artwork state.
+	const [vrEnabled, stickersEnabled, fursuitHasPhotos] = await navProbes;
+	const fursuitEnabled = getMode(platform!.env) !== 'off' && fursuitHasPhotos;
+	return {
+		...result,
+		view: fursuitEnabled && url.searchParams.get('view') === 'fursuit' ? ('fursuit' as const) : ('artwork' as const),
+		vrEnabled,
+		stickersEnabled,
+		fursuitEnabled
+	};
 };

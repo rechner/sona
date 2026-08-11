@@ -6,23 +6,31 @@
 	import { APP_NAME } from '$lib/config';
 	import * as m from '$lib/paraglide/messages';
 
-	let { siteName = APP_NAME }: { siteName?: string } = $props();
+	let {
+		siteName = APP_NAME,
+		stickersEnabled = true,
+		collectionsEnabled = true
+	}: { siteName?: string; stickersEnabled?: boolean; collectionsEnabled?: boolean } = $props();
 
 	const theme = getTheme();
 
-	const navItems = [
+	// Stickers and Collections are content-gated like the tab-bar pills: the
+	// link drops out while its section has no published content (About/Gallery
+	// always show). The defaults fail OPEN so a caller passing no flags keeps
+	// every link.
+	const navItems = $derived([
 		{ href: '/gallery', label: m.nav_gallery },
-		{ href: '/stickers', label: m.nav_stickers },
-		{ href: '/collections', label: m.nav_collections },
+		...(stickersEnabled ? [{ href: '/stickers', label: m.nav_stickers }] : []),
+		...(collectionsEnabled ? [{ href: '/collections', label: m.nav_collections }] : []),
 		{ href: '/about', label: m.nav_about }
-	];
+	]);
 </script>
 
 <header class="header">
 	<div class="header-inner container">
 		<a href="/" class="logo">{siteName}</a>
 		<nav>
-			{#each navItems as item}
+			{#each navItems as item (item.href)}
 				<a href={item.href} class="nav-link" class:active={$page.url.pathname.startsWith(item.href)}>
 					{item.label()}
 				</a>

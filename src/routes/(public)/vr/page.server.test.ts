@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 // better-sqlite3 ships no bundled types and is a dev-only test dependency here.
 // @ts-expect-error - no declaration file for 'better-sqlite3'
 import Database from 'better-sqlite3';
+import { clearStickerTabCache } from '$lib/server/stickers';
 import { makeD1 } from '$lib/server/test/d1';
 
 import { load } from './+page.server';
@@ -27,6 +28,7 @@ function makeDb() {
 			nsfw INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE TABLE fursuit_photos (id INTEGER PRIMARY KEY AUTOINCREMENT);
+		CREATE TABLE sticker_packs (id INTEGER PRIMARY KEY AUTOINCREMENT, published INTEGER NOT NULL DEFAULT 1);
 	`);
 	const d1 = makeD1(sqlite);
 	return { sqlite, platform: { env: { DB: d1 } } as unknown as App.Platform };
@@ -71,9 +73,13 @@ type IndexData = {
 		externalName: string | null;
 	}>;
 	total: number;
+	stickersEnabled: boolean;
 };
 
 async function loadData(platform: App.Platform): Promise<IndexData> {
+	// The stickers probe caches per-isolate; clear it so each load sees the
+	// current DB (the pill matrix below re-queries after seeding).
+	clearStickerTabCache();
 	return (await load({ platform } as never)) as IndexData;
 }
 
@@ -86,6 +92,32 @@ describe('/vr index load', () => {
 		const data = await loadData(platform);
 		expect(data.avatars.map((a) => a.slug)).toEqual(['live']);
 		expect(data.total).toBe(1);
+	});
+
+	it('gates the Stickers pill on a published pack existing (shared probe)', async () => {
+		const { sqlite, platform } = makeDb();
+		addAvatar(sqlite, { slug: 'live' });
+		// zero packs, then a draft -> hidden; a published pack -> shown
+		expect((await loadData(platform)).stickersEnabled).toBe(false);
+		sqlite.prepare('INSERT INTO sticker_packs (published) VALUES (0)').run();
+		expect((await loadData(platform)).stickersEnabled).toBe(false);
+		sqlite.prepare('INSERT INTO sticker_packs (published) VALUES (1)').run();
+		expect((await loadData(platform)).stickersEnabled).toBe(true);
+	});
+
+	it('fails OPEN (pill shown) when the stickers probe hits a D1 failure', async () => {
+		// Same posture as the (paths) layout's D1-error case: the probe is
+		// wrapped fail-open AT CREATION, so a rejecting stickers read can neither
+		// hide the pill, crash the load, nor float as an unhandled rejection
+		// while the fursuit COUNT is in flight.
+		const { sqlite, platform } = makeDb();
+		sqlite.exec('DROP TABLE sticker_packs'); // the probe's read now rejects
+		addAvatar(sqlite, { slug: 'live' });
+
+		const data = await loadData(platform);
+		expect(data.stickersEnabled).toBe(true);
+		// The rest of the page still loads normally.
+		expect(data.avatars.map((a) => a.slug)).toEqual(['live']);
 	});
 
 	it('joins the poster image and groups platform badges per avatar', async () => {

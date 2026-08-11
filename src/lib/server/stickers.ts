@@ -9,6 +9,7 @@
 
 import { inArray, eq, asc, and, sql, type SQL } from 'drizzle-orm';
 import { stickerPacks, stickers, stickerEmojis, artists, characters } from '$lib/server/db/schema';
+import { cachedProbe } from '$lib/server/nav-gating';
 import type { Database } from '$lib/server/db';
 
 export type PackShape = 'single' | 'multi';
@@ -150,6 +151,35 @@ async function artistMap(db: Database, ids: number[]): Promise<Map<number, Artis
 		await Promise.all(chunk(unique).map((c) => db.select().from(artists).where(inArray(artists.id, c))))
 	).flat();
 	return new Map(rows.map((r) => [r.id, artistView(r)]));
+}
+
+// Short-TTL per-isolate cache — see cachedProbe (nav-gating.ts) for the
+// rationale; the pack write paths (sticker-import.ts, the admin publish
+// toggle) clear it.
+const stickerTabProbe = cachedProbe(async (db) => {
+	const row = await db
+		.select({ one: sql<number>`1` })
+		.from(stickerPacks)
+		.where(eq(stickerPacks.published, true))
+		.limit(1)
+		.get();
+	return row !== undefined;
+}, 60_000);
+
+export function clearStickerTabCache() {
+	stickerTabProbe.clear();
+}
+
+/**
+ * Whether the public Stickers tab shows: at least one PUBLISHED pack exists
+ * (with zero, the pill stays out of every tab bar while /stickers itself keeps
+ * rendering its honest empty state). Mirrors vrTabEnabled — shared by the
+ * gallery and VR loads so the tab bars can never disagree. SELECT 1 … LIMIT 1
+ * existence probe, cached per-isolate; run it inside the callers' Promise.all
+ * (hot public pages).
+ */
+export async function stickerTabEnabled(db: Database): Promise<boolean> {
+	return stickerTabProbe.probe(db);
 }
 
 /**
