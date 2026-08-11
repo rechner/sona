@@ -15,5 +15,5 @@ jobs:
       uses: pozil/auto-assign-issue@v1
       with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          assignees: sparkyfen
+          assignees: ${{ github.repository_owner == 'sona-fast' && 'sparkyfen' || github.repository_owner }}
           numOfAssignee: 1
