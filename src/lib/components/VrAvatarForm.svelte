@@ -587,7 +587,7 @@
 				<div class="model-actions">
 					<label class="btn-sm">
 						{m.admin_vr_upload_replace()}
-						<input type="file" accept=".vrm,.fbx" onchange={onModelPicked} disabled={!publishingEnabled} class="sr-file" />
+						<input type="file" accept=".vrm,.fbx" onchange={onModelPicked} disabled={!publishingEnabled} class="sr-file" aria-describedby="vr-model-hint" />
 					</label>
 					<button type="button" class="btn-sm" onclick={removeModel}>{m.admin_vr_upload_remove()}</button>
 				</div>
@@ -602,7 +602,7 @@
 			<label class="upload-zone" class:disabled={!publishingEnabled}>
 				<UploadCloud size={22} />
 				<span>{m.admin_vr_dropzone({ max: formatBytes(MAX_VR_MODEL_BYTES) })}</span>
-				<input type="file" accept=".vrm,.fbx" onchange={onModelPicked} disabled={!publishingEnabled} class="sr-file" />
+				<input type="file" accept=".vrm,.fbx" onchange={onModelPicked} disabled={!publishingEnabled} class="sr-file" aria-describedby="vr-model-hint" />
 			</label>
 			{#if !publishingEnabled}
 				<p class="field-hint">{m.admin_vr_upload_locked()}</p>
@@ -619,6 +619,7 @@
 				{/if}
 			</div>
 		{/if}
+		<p class="field-hint" id="vr-model-hint">{m.admin_vr_model_hint()}</p>
 		<input type="hidden" name="modelUrl" value={modelUrl} />
 		<input type="hidden" name="modelFormat" value={modelFormat} />
 		<input type="hidden" name="modelSizeBytes" value={modelSizeBytes ?? ''} />
@@ -793,7 +794,7 @@
 						bind:checked={downloadable}
 						class="sr-checkbox"
 						aria-labelledby="vr-switch-downloadable"
-						aria-describedby="vr-switch-downloadable-state"
+						aria-describedby="vr-switch-downloadable-state vr-switch-downloadable-hint"
 					/>
 					<span class="switch-visual"></span>
 				</label>
@@ -802,6 +803,10 @@
 					<span id="vr-switch-downloadable-state">{downloadable ? m.admin_vr_switch_downloadable_on() : m.admin_vr_switch_downloadable_off()}</span>
 				</div>
 			</div>
+			<!-- Keep this hint immediately after the downloadable switch-row: its
+			     aria-describedby binds it to that checkbox, and a row inserted
+			     between them would visually attach it to the wrong switch. -->
+			<p class="field-hint switch-hint" id="vr-switch-downloadable-hint">{m.admin_vr_downloadable_hint()}</p>
 			<div class="switch-row">
 				<label class="switch-label">
 					<input
@@ -953,6 +958,10 @@
 	   over its own tint composites below 4.5:1 on three light themes (R3-A2 —
 	   asserted in theme-contrast.test.ts against the composite surface). */
 	.banner.err { background: color-mix(in srgb, var(--destructive) 12%, transparent); color: var(--foreground); }
+	/* Inside a section the flex gap already spaces siblings; the banner's own
+	   margin would stack on it (32px above the model hint reads as a section
+	   boundary). The form-level banner above the form keeps its margin. */
+	.section > .banner { margin-bottom: 0; }
 	.banner-line { margin: 0; overflow-wrap: anywhere; }
 	.banner-line + .banner-line { margin-top: 6px; }
 	.form { display: flex; flex-direction: column; gap: 32px; max-width: 700px; }
@@ -1123,6 +1132,8 @@
 	.sr-checkbox:disabled + .switch-visual { opacity: 0.5; cursor: not-allowed; }
 	.sr-checkbox:focus-visible + .switch-visual { outline: 2px solid var(--ring); outline-offset: 2px; }
 	.switch-text { display: flex; flex-direction: column; gap: 1px; }
+	/* Aligns with the text column: 36px switch + 12px row gap. */
+	.switch-hint { margin-left: 48px; margin-top: -10px; }
 	.switch-text strong { font-size: 13px; font-weight: 500; }
 	.switch-text span { font-size: 11px; color: var(--muted-foreground); }
 
