@@ -91,6 +91,11 @@ const webServer = (port: number, env: Record<string, string>) => ({
 
 export default defineConfig({
 	testDir: 'tests/e2e',
+	// Convention: playwright e2e specs are *.spec.ts; *.test.ts is vitest
+	// (fixture-integrity.test.ts lives beside the fixture it guards). Without
+	// this, playwright's default testMatch also collects .test.ts and explodes
+	// importing vitest's describe/it outside vitest's runtime.
+	testMatch: '**/*.spec.ts',
 	fullyParallel: true,
 	forbidOnly: !!process.env.CI,
 	retries: process.env.CI ? 1 : 0,
@@ -99,7 +104,14 @@ export default defineConfig({
 		// View Transitions animate the variant swap; reduce motion so assertions
 		// aren't racing a transition.
 		reducedMotion: 'reduce',
-		trace: 'on-first-retry'
+		trace: 'on-first-retry',
+		// WebGL for the vr-render spec: the GitHub Actions runner has no GPU, and
+		// headless chromium refuses software WebGL without an explicit opt-in.
+		// --use-angle=swiftshader routes ANGLE onto the bundled SwiftShader CPU
+		// rasterizer; --enable-unsafe-swiftshader is the opt-in newer Chromium
+		// builds additionally require (older builds ignore unknown flags, so the
+		// pair is safe across versions). Harmless for the non-WebGL specs.
+		launchOptions: { args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] }
 	},
 	projects: [
 		{
