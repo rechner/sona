@@ -30,6 +30,7 @@ export const load: PageServerLoad = async ({ platform }) => {
 			permissionSource: vrAvatars.permissionSource,
 			downloadable: vrAvatars.downloadable,
 			nsfw: vrAvatars.nsfw,
+			posterNsfw: images.nsfw,
 			published: vrAvatars.published,
 			characterName: characters.name,
 			posterUrl: images.imageUrl,
@@ -80,7 +81,9 @@ export const load: PageServerLoad = async ({ platform }) => {
 			// (names, dates, DM references) has no reason to ship to the client.
 			hasPermission: !!r.permissionSource,
 			downloadable: r.downloadable,
-			nsfw: r.nsfw,
+			// Effective public flag (avatar OR poster) — see the /vr/[slug] loader;
+			// the Mature chip must reflect the public state.
+			nsfw: r.nsfw || (r.posterNsfw ?? false),
 			published: r.published,
 			platformCount: platformCounts.get(r.id) ?? 0
 		})),

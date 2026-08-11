@@ -15,6 +15,7 @@ export const load: PageServerLoad = async ({ platform }) => {
 			slug: vrAvatars.slug,
 			name: vrAvatars.name,
 			nsfw: vrAvatars.nsfw,
+			posterNsfw: images.nsfw,
 			modelUrl: vrAvatars.modelUrl,
 			modelFormat: vrAvatars.modelFormat,
 			externalUrl: vrAvatars.externalUrl,
@@ -49,7 +50,8 @@ export const load: PageServerLoad = async ({ platform }) => {
 		return {
 			slug: r.slug,
 			name: r.name,
-			nsfw: r.nsfw,
+			// Effective public flag (avatar OR poster) — see the /vr/[slug] loader.
+			nsfw: r.nsfw || (r.posterNsfw ?? false),
 			posterUrl: r.posterThumbUrl || r.posterUrl,
 			platforms: platformsByAvatar[r.id] ?? [],
 			hasModel,
