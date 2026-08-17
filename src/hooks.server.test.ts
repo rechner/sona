@@ -17,6 +17,8 @@ import { isSetupComplete } from '$lib/server/admin-auth';
 import { authHandle, handleError } from './hooks.server';
 
 import { makeD1 } from '$lib/server/test/d1';
+import { ADMIN_AUTH_EXEMPT, isAdminAuthExempt } from '$lib/admin-routes';
+import { VIEWER_TZ_COOKIE } from '$lib/config';
 
 function makeDb(): D1Database {
 	const sqlite = new Database(':memory:');
@@ -76,6 +78,91 @@ describe('authHandle — password-recovery route exemption', () => {
 		const db = makeDb();
 
 		expect(await redirectFor('/admin/forgot', db)).toEqual({ status: 302, location: '/admin/setup' });
+	});
+
+	// The exempt list is one shared array now (SONA-119) — hooks.server.ts gates
+	// on it and the admin layout decides bare chrome and operator cookies from it.
+	// Drive every entry so a deletion can't slip through: dropping '/admin/setup'
+	// in particular would make first-run install redirect /admin/setup →
+	// /admin/login → /admin/setup forever, and nothing else in the suite notices.
+	it('lets every exempt route through with setup complete', async () => {
+		vi.mocked(isSetupComplete).mockResolvedValue(true);
+		const db = makeDb();
+
+		for (const route of ADMIN_AUTH_EXEMPT) {
+			expect(await redirectFor(route, db)).toBeNull();
+		}
+	});
+
+	it('leaves /admin/setup reachable while setup is incomplete (no redirect loop)', async () => {
+		vi.mocked(isSetupComplete).mockResolvedValue(false);
+		const db = makeDb();
+
+		expect(await redirectFor('/admin/setup', db)).toBeNull();
+	});
+});
+
+// SONA-119: the operator's zone is resolved once here so the admin loads and
+// actions all read one value. The cookie is attacker-suppliable and an unknown
+// zone makes Intl throw, so an unguarded value would 500 every admin page.
+describe('authHandle — viewer timezone on locals', () => {
+	function tzEvent(pathname: string, tz?: string) {
+		return {
+			cookies: { get: (name: string) => (name === VIEWER_TZ_COOKIE ? tz : undefined) },
+			url: new URL(`https://taro.surf${pathname}`),
+			locals: {} as App.Locals,
+			platform: { env: {} }
+		};
+	}
+	const resolveTz = async (pathname: string, tz?: string) => {
+		const event = tzEvent(pathname, tz);
+		// The zone is set before the session check, so an unauthenticated admin
+		// path still resolves it and then throws its redirect — swallow that.
+		try {
+			await authHandle({ event, resolve: async () => new Response('ok') } as never);
+		} catch {
+			// The redirect; the zone is already on locals.
+		}
+		return event.locals.timeZone;
+	};
+
+	it('resolves a real zone from the cookie on admin requests', async () => {
+		expect(await resolveTz('/admin/settings', 'Asia/Tokyo')).toBe('Asia/Tokyo');
+	});
+
+	it('falls back to UTC with no cookie', async () => {
+		expect(await resolveTz('/admin/settings')).toBe('UTC');
+	});
+
+	it('falls back to UTC on a hostile cookie rather than throwing', async () => {
+		expect(await resolveTz('/admin/settings', 'Not/AZone')).toBe('UTC');
+		expect(await resolveTz('/admin/settings', '../../etc/passwd')).toBe('UTC');
+	});
+
+	it('does not pay for zone validation on public requests', async () => {
+		// Only the admin area displays dates in the operator's zone; a public hit
+		// should not spend an Intl construction per request.
+		expect(await resolveTz('/gallery', 'Asia/Tokyo')).toBe('UTC');
+	});
+});
+
+describe('isAdminAuthExempt — segment matching', () => {
+	it('exempts an exempt route and its children', () => {
+		expect(isAdminAuthExempt('/admin/reset')).toBe(true);
+		// A recovery link carrying its token stays with its parent.
+		expect(isAdminAuthExempt('/admin/reset/abc123')).toBe(true);
+	});
+
+	it('does not exempt a sibling that merely shares the prefix', () => {
+		// A bare startsWith would hand these to anonymous visitors.
+		expect(isAdminAuthExempt('/admin/login-history')).toBe(false);
+		expect(isAdminAuthExempt('/admin/setup-audit')).toBe(false);
+		expect(isAdminAuthExempt('/admin/resets')).toBe(false);
+	});
+
+	it('does not exempt ordinary admin routes', () => {
+		expect(isAdminAuthExempt('/admin/settings')).toBe(false);
+		expect(isAdminAuthExempt('/admin/logout')).toBe(false);
 	});
 });
 
@@ -141,7 +228,7 @@ function metricsEvent(
 	pathname: string,
 	db: D1Database,
 	waits: Promise<unknown>[],
-	locals: App.Locals = {},
+	locals: App.Locals = { timeZone: 'UTC' },
 	envExtra: Record<string, string> = { OBSERVABILITY_ENABLED: 'true' }
 ) {
 	return {
@@ -490,7 +577,7 @@ describe('authHandle — 5xx counts toward the error rate (issue #6)', () => {
 		const { db, sqlite } = makeMetricsDb();
 		const waits: Promise<unknown>[] = [];
 		// errorSampled preset: a thrown exception already logged the detailed row.
-		await authHandle({ event: metricsEvent('/gallery', db, waits, { errorSampled: true }), resolve: resolve500 } as never);
+		await authHandle({ event: metricsEvent('/gallery', db, waits, { errorSampled: true, timeZone: 'UTC' }), resolve: resolve500 } as never);
 		await Promise.all(waits);
 
 		// Rollup still lands exactly once (rate stays correct)...
@@ -503,7 +590,7 @@ describe('authHandle — 5xx counts toward the error rate (issue #6)', () => {
 		const { db, sqlite } = makeMetricsDb();
 		const waits: Promise<unknown>[] = [];
 		// Empty envExtra => OBSERVABILITY_ENABLED unset => feature disabled.
-		await authHandle({ event: metricsEvent('/gallery', db, waits, {}, {}), resolve: resolve500 } as never);
+		await authHandle({ event: metricsEvent('/gallery', db, waits, { timeZone: 'UTC' }, {}), resolve: resolve500 } as never);
 		await Promise.all(waits);
 
 		// No request/error rollups and no error samples: the same 5xx that writes

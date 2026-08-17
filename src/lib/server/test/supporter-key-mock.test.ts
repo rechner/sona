@@ -26,8 +26,8 @@ describe('supporterKeyLiteralMockModule', () => {
 		// The spread alone would hand back the real resolver, which calls the real
 		// verifier internally — 'VALID' is not a signed token, so it would resolve
 		// to null here and a consumer would never know its switch was ignored.
-		expect(await resolveSupporterKeyStatus('VALID', now)).toMatchObject({ state: 'valid' });
-		expect(await resolveSupporterKeyStatus('anything-else', now)).toBeNull();
-		expect(await resolveSupporterKeyStatus('', now)).toBeNull();
+		expect(await resolveSupporterKeyStatus('VALID', now, 'UTC')).toMatchObject({ state: 'valid' });
+		expect(await resolveSupporterKeyStatus('anything-else', now, 'UTC')).toBeNull();
+		expect(await resolveSupporterKeyStatus('', now, 'UTC')).toBeNull();
 	});
 });

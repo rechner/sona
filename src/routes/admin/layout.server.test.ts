@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 // better-sqlite3 ships no bundled types and is a dev-only test dependency here.
 // @ts-expect-error - no declaration file for 'better-sqlite3'
 import Database from 'better-sqlite3';
@@ -15,6 +15,7 @@ import { APP_NAME } from '$lib/config';
 import { load } from './+layout.server';
 
 import { makeD1 } from '$lib/server/test/d1';
+import { expInDays } from '$lib/server/test/exp-in-days';
 
 // Same arrangement as the settings page tests, via the shared factory:
 // verification is stubbed (a passing token needs the sona.fast PRIVATE key),
@@ -40,6 +41,10 @@ const DAY_MS = 86_400_000;
 // own database, so the cache from the previous one would be a cross-test leak.
 beforeEach(() => {
 	clearSupporterKeyStatusCache();
+	// The memo can absorb a load without calling the verify at all, leaving a
+	// queued mockResolvedValueOnce behind to poison a LATER test's queue — reset
+	// the queue as well as the cache.
+	vi.mocked(verifySupporterKey).mockReset();
 });
 
 function makeLoadDb() {
@@ -55,16 +60,34 @@ function makeLoadDb() {
 // The load reads locals.admin (set by hooks.server.ts) and the dismissal cookie.
 function loadEvent(
 	platform: App.Platform | undefined,
-	{ admin = true, cookie }: { admin?: boolean; cookie?: string } = {}
+	{ admin = true, cookie, tz }: { admin?: boolean; cookie?: string; tz?: string } = {}
 ) {
 	return {
 		platform,
-		locals: { admin },
+		// timeZone is resolved in hooks (SONA-119), so the load reads it off locals
+		// rather than the cookie; 'UTC' is what an absent/unusable cookie yields.
+		locals: { admin, timeZone: tz ?? 'UTC' },
 		cookies: { get: (name: string) => (name === 'supporterNoticeDismissed' ? cookie : undefined) }
 	} as never;
 }
 
 type NoticeResult = { supporterKeyNotice: { daysRemaining: number; dismissValue: string } | null };
+
+async function loadWithZone(expiresAt: Date, tz?: string) {
+	const { db, platform } = makeLoadDb();
+	await setRawSetting(db, 'supporterKey', 'head.tail');
+	vi.mocked(verifySupporterKey).mockResolvedValueOnce({
+		valid: true,
+		login: 'sparky',
+		tier: 2,
+		expiresAt
+	});
+	return (await load(loadEvent(platform, { tz }))) as NoticeResult;
+}
+
+afterEach(() => {
+	vi.useRealTimers();
+});
 
 describe('admin layout load — supporter-key expiry notice (SONA-114)', () => {
 	it('is null with no stored key', async () => {
@@ -82,7 +105,7 @@ describe('admin layout load — supporter-key expiry notice (SONA-114)', () => {
 			valid: true,
 			login: 'sparky',
 			tier: 2,
-			expiresAt: new Date(Date.now() + 40 * DAY_MS)
+			expiresAt: expInDays(40)
 		});
 
 		const result = (await load(loadEvent(platform))) as NoticeResult;
@@ -99,7 +122,7 @@ describe('admin layout load — supporter-key expiry notice (SONA-114)', () => {
 			valid: true,
 			login: 'sparky',
 			tier: 2,
-			expiresAt: new Date(Date.now() + 6.5 * DAY_MS)
+			expiresAt: expInDays(7)
 		});
 
 		const result = (await load(loadEvent(platform))) as NoticeResult & Record<string, unknown>;
@@ -115,6 +138,56 @@ describe('admin layout load — supporter-key expiry notice (SONA-114)', () => {
 		expect(result.supporterKeyNotice?.dismissValue).toMatch(/^\d{4}\.\d{2}\.\d{2}:early$/);
 		// The layout payload rides along on every admin page — the token must not.
 		expect(JSON.stringify(result)).not.toContain('head.tail');
+	});
+
+	// SONA-119: the operator's zone reaches the load through the tz cookie, and
+	// BOTH the date and the count are read in it. Computing them in the browser
+	// instead would make SSR print the UTC answer and hydration overwrite it.
+	it('reads the expiry date and the countdown in the tz cookie zone', async () => {
+		// Pinned clock: the load reads new Date(), and whether Tokyo is already on
+		// the next UTC calendar day is exactly what decides the numbers below. At
+		// 12:00 UTC it is not (21:00 JST, same date), so the offset is the key's
+		// own — from 15:00 UTC the two zones would agree and this would fail.
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-08-13T12:00:00Z'));
+		// exp = midnight UTC, so its last covered instant (23:59:59Z) is already
+		// the next calendar day anywhere east of UTC. Five days out so both zones
+		// sit inside the warn window (which is itself now judged in that zone).
+		const expiresAt = new Date('2026-08-18T00:00:00Z');
+		const utc = await loadWithZone(expiresAt);
+		const tokyo = await loadWithZone(expiresAt, 'Asia/Tokyo');
+
+		// Tokyo's last covered day is one calendar day further out than UTC's, and
+		// the displayed count moves with the displayed date.
+		expect(utc.supporterKeyNotice?.daysRemaining).toBe(5);
+		expect(tokyo.supporterKeyNotice?.daysRemaining).toBe(6);
+		// The dismissal key does NOT move with the zone: it is UTC-pinned, so a
+		// notice dismissed before the tz cookie arrived (or before the operator
+		// travelled) stays dismissed rather than springing back.
+		expect(tokyo.supporterKeyNotice?.dismissValue).toBe(utc.supporterKeyNotice?.dismissValue);
+	});
+
+	it('keeps the dismissal value zone-free across the early/final phase boundary', async () => {
+		// The phase boundary, not just the date: the previous version appended a
+		// phase counted in the VIEWER's zone to a UTC-pinned key, so the two halves
+		// could disagree and a dismissal made in one zone stopped matching in the
+		// other. The zone test above never caught it — days 5 and 6 are both 'early',
+		// so its two dismissValues coincided for the wrong reason.
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date('2026-08-29T15:00:00Z'));
+		// Straddles EXPIRY_FINAL_DAYS (3): UTC counts 3 ('final'), London — one hour
+		// ahead, so its "now" is still the 29th while its last covered day is the
+		// 1st — counts 4 ('early').
+		const expiresAt = new Date('2026-09-01T00:00:00Z');
+		const utc = await loadWithZone(expiresAt);
+		const london = await loadWithZone(expiresAt, 'Europe/London');
+
+		// The displayed countdown still moves with the viewer's zone...
+		expect(utc.supporterKeyNotice?.daysRemaining).toBe(3);
+		expect(london.supporterKeyNotice?.daysRemaining).toBe(4);
+		// ...but the dismissal value, phase included, does not.
+		expect(london.supporterKeyNotice?.dismissValue).toBe(utc.supporterKeyNotice?.dismissValue);
+		expect(utc.supporterKeyNotice?.dismissValue).toBe('2026.08.31:final');
 	});
 
 	it('is null for an expired key (the settings page owns that state)', async () => {
@@ -218,7 +291,7 @@ describe('admin layout load — cookie dismissal with phase re-warn (SONA-114)',
 	it('suppresses the notice when the cookie matches the current key + phase', async () => {
 		// First load learns the dismissValue; a second load of the SAME key with it
 		// as the cookie (same phase) renders no notice.
-		const expiresAt = new Date(Date.now() + 6.5 * DAY_MS);
+		const expiresAt = expInDays(7);
 		const first = await loadWithNotice(expiresAt);
 		const dismissValue = first.supporterKeyNotice!.dismissValue;
 
@@ -231,7 +304,7 @@ describe('admin layout load — cookie dismissal with phase re-warn (SONA-114)',
 		// Same key, now inside the final 3 days: its dismissValue carries ':final',
 		// so a cookie recorded during the early phase no longer matches and the
 		// notice comes back for the last-chance warning.
-		const expiresAt = new Date(Date.now() + 2.5 * DAY_MS);
+		const expiresAt = expInDays(3);
 		const first = await loadWithNotice(expiresAt);
 		const finalDismiss = first.supporterKeyNotice!.dismissValue;
 		expect(finalDismiss).toMatch(/:final$/);
@@ -246,7 +319,7 @@ describe('admin layout load — cookie dismissal with phase re-warn (SONA-114)',
 		// Phases are ordered: a final-phase dismissal covers the whole warning
 		// window for that validUntil, so a request landing a phase earlier (clock
 		// skew, stale edge cache) must not resurrect an already-dismissed notice.
-		const expiresAt = new Date(Date.now() + 6.5 * DAY_MS);
+		const expiresAt = expInDays(7);
 		const first = await loadWithNotice(expiresAt);
 		const earlyDismiss = first.supporterKeyNotice!.dismissValue;
 		expect(earlyDismiss).toMatch(/:early$/);

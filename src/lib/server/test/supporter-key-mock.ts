@@ -22,8 +22,10 @@ export async function supporterKeyMockModule(
 	return {
 		...actual,
 		verifySupporterKey,
-		resolveSupporterKeyStatus: async (token: string, now: Date) =>
-			token ? actual.supporterKeyStatusFromResult(await verifySupporterKey(token, now), now) : null
+		resolveSupporterKeyStatus: async (token: string, now: Date, timeZone: string) =>
+			token
+				? actual.supporterKeyStatusFromResult(await verifySupporterKey(token, now), now, timeZone)
+				: null
 	};
 }
 
@@ -50,7 +52,9 @@ export async function supporterKeyLiteralMockModule(
 		// resolver calls the real verifier internally, so a spread copy would
 		// answer from production crypto no matter what this factory says. Every
 		// token fails that way, which is the shape a test passes vacuously in.
-		resolveSupporterKeyStatus: async (token: string, now: Date) =>
-			token ? original.supporterKeyStatusFromResult(await verifySupporterKey(token), now) : null
+		resolveSupporterKeyStatus: async (token: string, now: Date, timeZone = 'UTC') =>
+			token
+				? original.supporterKeyStatusFromResult(await verifySupporterKey(token), now, timeZone)
+				: null
 	};
 }

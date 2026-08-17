@@ -14,7 +14,7 @@
 	import { THEMES } from '$lib/themes';
 	import { LANDING_LAYOUTS } from '$lib/landing';
 	import { resendSetupProgress } from '$lib/resend-setup';
-	import { resolveTabId, type TabId } from './tabs';
+	import { resolveTabId, visibleTabIds, type TabId } from './tabs';
 	import { showUtFileStat } from './ut-stat';
 	import { baseLocale, locales } from '$lib/paraglide/runtime';
 	import { earlyAccessLabel } from '$lib/early-access-label';
@@ -197,6 +197,44 @@
 		}
 	}
 
+	// The tablist renders from SETTINGS_TAB_IDS rather than a hand-written row of
+	// buttons (SONA-119), so an added tab can't be missed here. Record<TabId, …>
+	// makes a tab with no label a type error rather than a blank button.
+	const TAB_LABELS: Record<TabId, () => string> = {
+		site: m.admin_settings_tab_site,
+		connections: m.admin_settings_tab_connections,
+		storage: m.admin_settings_tab_storage,
+		account: m.admin_settings_tab_account,
+		observability: m.admin_settings_tab_observability
+	};
+	const tabs = $derived(visibleTabIds(data.observabilityEnabled));
+	// activeTab can name a tab that isn't offered — a manual pick survives a data
+	// reload that turns the observability gate off. Clamping keeps exactly one tab
+	// tabbable (roving tabindex) and keeps the panel's label pointing at a real id.
+	const selectedTab = $derived(tabs.includes(activeTab) ? activeTab : tabs[0]);
+	const tabButtonId = (tab: TabId) => `settings-tab-${tab}`;
+	let tabButtons = $state<(HTMLButtonElement | undefined)[]>([]);
+
+	// role="tab" comes with a keyboard contract: one tab stop for the whole
+	// tablist (roving tabindex, below) and arrows to move within it. Selection
+	// follows focus — every panel is already rendered, so activating on arrow
+	// costs nothing.
+	function onTabKeydown(e: KeyboardEvent) {
+		// Modifier chords belong to the browser: Cmd/Alt+Left and Right are Back
+		// and Forward, Ctrl/Cmd+Home and End jump the document.
+		if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+		const from = tabs.indexOf(selectedTab);
+		let next: number;
+		if (e.key === 'ArrowRight') next = (from + 1) % tabs.length;
+		else if (e.key === 'ArrowLeft') next = (from - 1 + tabs.length) % tabs.length;
+		else if (e.key === 'Home') next = 0;
+		else if (e.key === 'End') next = tabs.length - 1;
+		else return;
+		e.preventDefault();
+		selectTab(tabs[next]);
+		tabButtons[next]?.focus();
+	}
+
 	// Usage bar reflects the ACTIVE provider. R2 has no simple usage API, so we use
 	// the DB-tracked total (every image is on the active store) against the 10GB free tier.
 	const activeUsage = $derived(
@@ -302,23 +340,33 @@
 	};
 </script>
 
-<div class="settings-tabs" data-active-tab={activeTab}>
+<div class="settings-tabs" data-active-tab={selectedTab}>
 	<div class="settings-header">
 		<div class="page-header">
 			<h1>{m.admin_nav_settings()}</h1>
 		</div>
-		<nav class="settings-tabnav">
-			<button type="button" class:active={activeTab === 'site'} aria-current={activeTab === 'site' ? 'true' : undefined} onclick={() => selectTab('site')}>{m.admin_settings_tab_site()}</button>
-			<button type="button" class:active={activeTab === 'connections'} aria-current={activeTab === 'connections' ? 'true' : undefined} onclick={() => selectTab('connections')}>{m.admin_settings_tab_connections()}</button>
-			<button type="button" class:active={activeTab === 'storage'} aria-current={activeTab === 'storage' ? 'true' : undefined} onclick={() => selectTab('storage')}>{m.admin_settings_tab_storage()}</button>
-			<button type="button" class:active={activeTab === 'account'} aria-current={activeTab === 'account' ? 'true' : undefined} onclick={() => selectTab('account')}>{m.admin_settings_tab_account()}</button>
-			{#if data.observabilityEnabled}
-				<button type="button" class:active={activeTab === 'observability'} aria-current={activeTab === 'observability' ? 'true' : undefined} onclick={() => selectTab('observability')}>{m.admin_settings_tab_observability()}</button>
-			{/if}
-		</nav>
+		<div class="settings-tabnav" role="tablist" aria-label={m.admin_nav_settings()}>
+			{#each tabs as tab, i (tab)}
+				<button
+					type="button"
+					role="tab"
+					id={tabButtonId(tab)}
+					aria-selected={selectedTab === tab}
+					aria-controls="settings-panels"
+					tabindex={selectedTab === tab ? 0 : -1}
+					bind:this={tabButtons[i]}
+					class:active={selectedTab === tab}
+					onclick={() => selectTab(tab)}
+					onkeydown={onTabKeydown}>{TAB_LABELS[tab]()}</button
+				>
+			{/each}
+		</div>
 	</div>
 
-	<div class="settings-panels">
+	<!-- One panel for all tabs: the sections live in a single flow and the active
+	     tab hides the rest via CSS, so the panel is relabelled by whichever tab
+	     is selected rather than swapped out. -->
+	<div class="settings-panels" id="settings-panels" role="tabpanel" aria-labelledby={tabButtonId(selectedTab)}>
 <form method="POST" action="?/saveSite" class="contents" use:enhance={() => {
 	savingSite = true;
 	return async ({ result, update }) => {
@@ -1240,6 +1288,13 @@
 		color: var(--muted-foreground);
 		white-space: nowrap;
 	}
+	/* The strip scrolls (overflow-x: auto), which clips an outset ring top and
+	   bottom — inset it so arrowing through the roving tabindex stays visible. */
+	.settings-tabnav button:focus-visible {
+		outline: 2px solid var(--ring);
+		outline-offset: -2px;
+	}
+
 	.settings-tabnav button:hover {
 		color: var(--foreground);
 	}

@@ -1,4 +1,4 @@
-import { formatDate } from '$lib/index';
+import { supporterKeyValidUntil, supporterKeyDaysRemaining } from './supporter-key-expiry';
 
 // Ed25519 SPKI (DER) public key, base64, that the sona.fast issuer signs
 // supporter keys with. Baked in so verification needs no network and no config.
@@ -46,10 +46,28 @@ function base64urlToBytes(segment: string): Uint8Array | null {
 	return base64ToBytes(b64 + pad);
 }
 
+/** ECMAScript's maximum time value is 8.64e15 ms either side of the epoch, so
+ * this is the largest `exp` (in seconds) that `new Date(exp * 1000)` can
+ * represent. Beyond it the Date is Invalid, and every Intl call we make on it
+ * throws a RangeError. */
+const MAX_EXP_SECONDS = 8.64e12;
+
 function isPayload(v: unknown): v is SupporterKeyPayload {
 	if (typeof v !== 'object' || v === null) return false;
 	const p = v as Record<string, unknown>;
-	return p.v === 1 && typeof p.login === 'string' && typeof p.tier === 'number' && typeof p.exp === 'number';
+	return (
+		p.v === 1 &&
+		typeof p.login === 'string' &&
+		typeof p.tier === 'number' &&
+		typeof p.exp === 'number' &&
+		// A nonsense exp is refused here, at the door, rather than downstream. It
+		// would otherwise pass: `now >= expiresAt` is false for an Invalid Date, so
+		// the key would be reported VALID and then throw a RangeError out of the
+		// first date we formatted — taking down /admin/settings, the one page an
+		// operator could use to remove the offending key.
+		Number.isFinite(p.exp) &&
+		Math.abs(p.exp) <= MAX_EXP_SECONDS
+	);
 }
 
 /**
@@ -112,18 +130,6 @@ export async function verifySupporterKey(
 }
 
 /**
- * The "valid until" / "expired" display date (dotted YYYY.MM.DD, the repo
- * standard). `exp` is end-of-day UTC, so the last covered calendar day is
- * `exp - 1 second` read in UTC — that's the date the key actually covers.
- */
-export function supporterKeyDisplayDate(expiresAt: Date): string {
-	const d = new Date(expiresAt.getTime() - 1000);
-	const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
-	const da = String(d.getUTCDate()).padStart(2, '0');
-	return formatDate(`${d.getUTCFullYear()}-${mo}-${da}`);
-}
-
-/**
  * The masked record of the stored key shown on the settings card: enough head
  * to recognize which key is installed, enough tail to spot-check a paste.
  *
@@ -149,17 +155,6 @@ export const EXPIRY_WARN_DAYS = 7;
  * a last-chance warning (see the admin layout load's dismissal cookie). */
 export const EXPIRY_FINAL_DAYS = 3;
 
-const DAY_MS = 86_400_000;
-
-/**
- * Whole days until the key stops working, rounded up. `exp` is end-of-day UTC,
- * so 1 means the key expires today (its last covered day) and 0 or less means
- * it has already expired.
- */
-export function supporterKeyDaysRemaining(expiresAt: Date, now: Date): number {
-	return Math.ceil((expiresAt.getTime() - now.getTime()) / DAY_MS);
-}
-
 /** Client-facing supporter-key status shared by the settings page and the
  * admin layout. Never contains the decoded payload beyond what the UI shows,
  * and never the token itself — the settings load (which alone needs it for the
@@ -167,8 +162,22 @@ export function supporterKeyDaysRemaining(expiresAt: Date, now: Date): number {
  * the layout payload structurally cannot leak the key. */
 export interface SupporterKeyStatus {
 	state: 'valid' | 'expired';
+	/** Last covered day, read in the viewer's zone — a display value only. */
 	validUntil: string;
-	/** Days until expiry (1 = expires today); 0 for the expired state. */
+	/** The same day pinned to UTC, so it names one key regardless of where the
+	 * operator is. The notice's dismissal cookie is keyed on this: keying it on
+	 * the displayed date would resurrect a dismissed notice the moment the zone
+	 * changed — on the first page view that has the tz cookie, or on travel —
+	 * while still warning afresh for a genuinely re-minted key. */
+	dismissKey: string;
+	/** Which half of the warning window the key is in, counted in UTC for the
+	 * same reason dismissKey is: it is the other half of the dismissal cookie's
+	 * value, and a phase read in the viewer's zone would flip a day earlier east
+	 * of UTC — resurrecting a dismissed notice on travel, which pinning the key
+	 * alone does not prevent. Display never uses this; daysRemaining does that. */
+	dismissPhase: 'early' | 'final';
+	/** Days until expiry (1 = expires today); 0 for the expired state. Counted
+	 * in the same zone as validUntil — the pair is the point (SONA-119). */
 	daysRemaining: number;
 	/** True when valid and within EXPIRY_WARN_DAYS of expiry. */
 	expiringSoon: boolean;
@@ -181,13 +190,22 @@ export interface SupporterKeyStatus {
  */
 export function supporterKeyStatusFromResult(
 	res: SupporterKeyResult,
-	now: Date
+	now: Date,
+	timeZone: string
 ): SupporterKeyStatus | null {
 	if (res.valid) {
-		const daysRemaining = supporterKeyDaysRemaining(res.expiresAt, now);
+		// Calendar days in the viewer's zone — the same zone validUntil is read in,
+		// which is what stops the number and the date naming different days.
+		const daysRemaining = supporterKeyDaysRemaining(res.expiresAt.getTime(), now.getTime(), timeZone);
+		// The phase rides on the dismissal cookie, so it is counted in UTC rather
+		// than reusing daysRemaining above — the two disagree by a day for part of
+		// each day east of UTC.
+		const utcDaysRemaining = supporterKeyDaysRemaining(res.expiresAt.getTime(), now.getTime(), 'UTC');
 		return {
 			state: 'valid',
-			validUntil: supporterKeyDisplayDate(res.expiresAt),
+			validUntil: supporterKeyValidUntil(res.expiresAt.getTime(), timeZone),
+			dismissKey: supporterKeyValidUntil(res.expiresAt.getTime(), 'UTC'),
+			dismissPhase: utcDaysRemaining <= EXPIRY_FINAL_DAYS ? 'final' : 'early',
 			daysRemaining,
 			expiringSoon: daysRemaining <= EXPIRY_WARN_DAYS
 		};
@@ -195,7 +213,10 @@ export function supporterKeyStatusFromResult(
 	if (res.reason === 'expired') {
 		return {
 			state: 'expired',
-			validUntil: supporterKeyDisplayDate(res.expiresAt),
+			validUntil: supporterKeyValidUntil(res.expiresAt.getTime(), timeZone),
+			dismissKey: supporterKeyValidUntil(res.expiresAt.getTime(), 'UTC'),
+			// An expired key never renders the notice, so the phase is inert here.
+			dismissPhase: 'final',
 			daysRemaining: 0,
 			expiringSoon: false
 		};
@@ -204,7 +225,11 @@ export function supporterKeyStatusFromResult(
 }
 
 /** Verify a stored token and shape the result for display (empty token → null). */
-export async function resolveSupporterKeyStatus(token: string, now: Date): Promise<SupporterKeyStatus | null> {
+export async function resolveSupporterKeyStatus(
+	token: string,
+	now: Date,
+	timeZone: string
+): Promise<SupporterKeyStatus | null> {
 	if (!token) return null;
-	return supporterKeyStatusFromResult(await verifySupporterKey(token, now), now);
+	return supporterKeyStatusFromResult(await verifySupporterKey(token, now), now, timeZone);
 }

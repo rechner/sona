@@ -2,7 +2,6 @@ import { getDb } from '$lib/server/db';
 import { getSettings, getSupporterKeyStatus } from '$lib/server/settings';
 import { isRegistryEnabled, resolveRegistryEnv } from '$lib/server/registry';
 import { isObservabilityEnabled } from '$lib/server/metrics';
-import { EXPIRY_FINAL_DAYS } from '$lib/server/supporter-key';
 import { APP_NAME } from '$lib/config';
 import type { LayoutServerLoad } from './$types';
 
@@ -32,18 +31,26 @@ export const load: LayoutServerLoad = async ({ platform, locals, cookies }) => {
 		// the read nor the verify is paid on every admin page request. It propagates
 		// D1 errors (getSettings self-catches); a failed read must degrade only the
 		// notice, not drop the chrome to EMPTY.
+		// The operator's own zone (SONA-119) rides in as the third argument,
+		// resolved in hooks from the cookie the admin layout writes on every
+		// signed-in navigation; absent (no JS, or before the first signed-in page
+		// of a browser) it is UTC. The memo underneath caches only zone-independent
+		// verified facts, so one operator's zone-rendered dates are never served
+		// to another.
 		const [renv, supporterKey] = await Promise.all([
 			resolveRegistryEnv(db, platform.env),
-			locals.admin ? getSupporterKeyStatus(db, new Date()).catch(() => null) : null
+			locals.admin ? getSupporterKeyStatus(db, new Date(), locals.timeZone).catch(() => null) : null
 		]);
-		// Dismissal is a cookie keyed on validUntil PLUS a phase ('early' = days
-		// 7..4, 'final' = last 3 days): dismissing during the early phase re-shows
-		// the notice once the final days start, and a re-minted key (new
-		// validUntil) always warns afresh. SSR reads the cookie so the banner
-		// renders in its final state — no post-hydration layout shift.
-		const phase = supporterKey && supporterKey.daysRemaining <= EXPIRY_FINAL_DAYS ? 'final' : 'early';
-		const dismissValue = supporterKey ? `${supporterKey.validUntil}:${phase}` : '';
-		// Phases are ordered: a 'final' dismissal for the same validUntil also
+		// Dismissal is a cookie keyed on the key's UTC-pinned dismissKey PLUS a
+		// phase ('early' = days 7..4, 'final' = last 3 days): dismissing during the
+		// early phase re-shows the notice once the final days start, and a re-minted
+		// key (new expiry) always warns afresh. SSR reads the cookie so the banner
+		// renders in its final state — no post-hydration layout shift. BOTH halves
+		// are UTC-pinned rather than read off the displayed date and countdown, so
+		// acquiring the tz cookie (or travelling) cannot resurrect a notice the
+		// operator already dismissed.
+		const dismissValue = supporterKey ? `${supporterKey.dismissKey}:${supporterKey.dismissPhase}` : '';
+		// Phases are ordered: a 'final' dismissal for the same key also
 		// suppresses the early phase (a stale final cookie must not re-warn if a
 		// request lands a phase earlier), while an early dismissal never covers
 		// the final phase.
@@ -53,7 +60,7 @@ export const load: LayoutServerLoad = async ({ platform, locals, cookies }) => {
 		// would satisfy the comparison, an attacker-suppliable value that a later
 		// change to the notice condition could make meaningful. Keep it.
 		const dismissed =
-			!!supporterKey && (cookie === dismissValue || cookie === `${supporterKey.validUntil}:final`);
+			!!supporterKey && (cookie === dismissValue || cookie === `${supporterKey.dismissKey}:final`);
 		return {
 			adminAvatarUrl: settings.adminAvatarUrl || null,
 			siteName: settings.siteName,

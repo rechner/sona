@@ -7,10 +7,36 @@
 	import AdminTabs from '$lib/components/AdminTabs.svelte';
 	import LanguageToggle from '$lib/components/LanguageToggle.svelte';
 	import * as m from '$lib/paraglide/messages';
+	import { isAdminAuthExempt } from '$lib/admin-routes';
+	import { VIEWER_TZ_COOKIE } from '$lib/config';
 
 	let { children, data } = $props();
 
 	const theme = getTheme();
+
+	// Publish the operator's timezone to the server (SONA-119). The supporter-key
+	// expiry date and the countdown beside it are rendered server-side so SSR and
+	// hydration can't disagree; the server can only read them in the operator's own
+	// zone if we tell it which one that is. Scoped like the dismissal cookie below
+	// — path=/admin, and never from a signed-out page — so it stays an operator
+	// cookie rather than one planted on anyone who loads the sign-in screen.
+	//
+	// An effect, not onMount: this layout instance is reused across every admin
+	// navigation, so a mount-only write would run once on the sign-in page — the
+	// one place it is skipped — and the cookie would never appear for the rest of
+	// the session. Effects don't run during SSR, and re-writing the same value is
+	// free, so this needs no guard.
+	//
+	// Deliberately no invalidateAll(): re-running the loads would swap `data` out
+	// from under the settings page's form-resync effect and wipe whatever the
+	// operator had already typed. The zone takes effect on the next navigation.
+	$effect(() => {
+		if (isAdminAuthExempt($page.url.pathname)) return;
+		const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+		if (!zone) return;
+		const secure = location.protocol === 'https:' ? '; Secure' : '';
+		document.cookie = `${VIEWER_TZ_COOKIE}=${encodeURIComponent(zone)}; path=/admin; SameSite=Lax; max-age=31536000${secure}`;
+	});
 
 	// Supporter-key expiry notice (SONA-114): shown on every admin page while
 	// the key is inside its warning window. Dismissal is a cookie keyed on the
@@ -58,7 +84,7 @@
 
 </script>
 
-{#if ['/admin/login', '/admin/setup', '/admin/forgot', '/admin/reset'].includes($page.url.pathname)}
+{#if isAdminAuthExempt($page.url.pathname)}
 	{@render children()}
 {:else}
 	<div class="admin-layout">

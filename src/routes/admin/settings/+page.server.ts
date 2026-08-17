@@ -56,10 +56,10 @@ import { resolveRefImage, refImageSource } from '$lib/server/ref-image';
 import { isObservabilityEnabled } from '$lib/server/metrics';
 import {
 	verifySupporterKey,
-	supporterKeyDisplayDate,
 	supporterKeyDisplayRecord,
 	resolveSupporterKeyStatus
 } from '$lib/server/supporter-key';
+import { supporterKeyValidUntil } from '$lib/server/supporter-key-expiry';
 import { earlyAccessActive } from '$lib/early-access';
 import { formatDate } from '$lib/index';
 import { isValidThemeId, DEFAULT_THEME_ID } from '$lib/themes';
@@ -70,7 +70,7 @@ import type { Actions, PageServerLoad } from './$types';
 
 const SESSION_DURATION = 60 * 60 * 24 * 7; // 7 days in seconds
 
-export const load: PageServerLoad = async ({ platform, url }) => {
+export const load: PageServerLoad = async ({ platform, url, locals }) => {
 	const db = getDb(platform!.env.DB);
 	// The editor must render current persisted values, not a cached snapshot.
 	const settings = await getSettings(db, { fresh: true });
@@ -148,7 +148,9 @@ export const load: PageServerLoad = async ({ platform, url }) => {
 	// and falls through to the empty state.
 	const now = new Date();
 	const supporterToken = (await getRawSetting(db, 'supporterKey')) ?? '';
-	const status = await resolveSupporterKeyStatus(supporterToken, now);
+	// Viewer's zone (SONA-119) so the card's date and the countdown beside it are
+	// read off one instant in one zone — and identically on SSR and after hydration.
+	const status = await resolveSupporterKeyStatus(supporterToken, now, locals.timeZone);
 	// Only the MASKED record rides to the client — the full signed token stays on
 	// the server (the card renders the mask, and neither the save form nor the
 	// remove action sends the stored value back). The shared SupporterKeyStatus
@@ -527,7 +529,7 @@ export const actions = {
 	// verifies AND isn't expired is stored — an invalid or expired paste fails
 	// with a field error and persists nothing. The component localizes the error
 	// from the returned code (server action errors aren't locale-aware here).
-	saveSupporterKey: async ({ request, platform }) => {
+	saveSupporterKey: async ({ request, platform, locals }) => {
 		const db = getDb(platform!.env.DB);
 		const data = await request.formData();
 		// Strip ALL whitespace: the stored key is displayed wrapped, and a paste
@@ -543,7 +545,7 @@ export const actions = {
 			if (res.reason === 'expired') {
 				return fail(400, {
 					supporterKeyError: 'expired',
-					supporterKeyExpiredDate: supporterKeyDisplayDate(res.expiresAt)
+					supporterKeyExpiredDate: supporterKeyValidUntil(res.expiresAt.getTime(), locals.timeZone)
 				});
 			}
 			return fail(400, { supporterKeyError: 'invalid', supporterKeyExpiredDate: undefined });

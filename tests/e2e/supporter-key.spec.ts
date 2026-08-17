@@ -1,6 +1,14 @@
 import { test, expect, type Page } from '@playwright/test';
 import { adminLogin } from './admin-login';
 
+// The wire name of the tz cookie, kept as a literal rather than imported from
+// $lib/config: Playwright runs these specs outside Vite, so anything reaching
+// $app/environment (as config.ts does) fails to resolve and the whole file
+// collects zero tests. Asserting the literal is also what a black-box check
+// should do — a rename of VIEWER_TZ_COOKIE is a visible change here, not a
+// silently-following one.
+const VIEWER_TZ_COOKIE = 'sona_tz';
+
 // Supporter-key settings flow (SONA-105): the Account tab's empty state renders
 // (explainer + Key field), a garbage key is rejected with the invalid error AND
 // the correct aria wiring (aria-invalid + aria-describedby → the error's id), and
@@ -36,7 +44,7 @@ const fieldError = (page: Page) => page.locator('.field-error#supporter-key-erro
 // whole click-until-visible like the palette spec's hydration-sensitive steps.
 async function openAccountTab(page: Page) {
 	await expect(async () => {
-		await page.getByRole('button', { name: 'Account', exact: true }).click();
+		await page.getByRole('tab', { name: 'Account', exact: true }).click();
 		await expect(keyInput(page)).toBeVisible({ timeout: 1500 });
 	}).toPass();
 }
@@ -79,5 +87,72 @@ test.describe('admin settings supporter key', () => {
 		// baked public key (reached the expiry check, not bad-signature).
 		await expect(fieldError(page)).toHaveText(/That key expired .* re-mint at sona\.fast\/supporter-key\./);
 		await expect(keyInput(page)).toHaveAttribute('aria-invalid', 'true');
+	});
+});
+
+test.describe('admin settings supporter key — UTC viewer', () => {
+	// Pinned, not inherited: without this the runner's own zone decides the date
+	// and the test passes or fails by geography.
+	test.use({ timezoneId: 'UTC' });
+
+	test('a UTC browser gets the UTC calendar day', async ({ page }) => {
+		await login(page);
+		await page.goto('/admin/settings');
+		await openAccountTab(page);
+		await keyInput(page).fill(EXPIRED_TOKEN);
+		await saveButton(page).click();
+
+		// The token's last covered instant is 2025-07-16T23:59:59Z.
+		await expect(fieldError(page)).toContainText('2025.07.16');
+	});
+});
+
+// SONA-119: the operator's zone reaches the server through a cookie the admin
+// layout writes on every signed-in navigation, and the server renders every
+// expiry date in it. This drives the whole round trip in a real browser — the
+// unit tests only ever feed the server a hand-written cookie, so nothing else
+// would catch the client half silently breaking (wrong cookie name, wrong path,
+// a throwing Intl call) and leaving every operator on UTC, which is the very bug
+// SONA-119 exists to fix.
+//
+// The expired token's last covered instant is 2025-07-16T23:59:59Z: still the
+// 16th in UTC, already the 17th in Tokyo. One date tells the two apart.
+test.describe('admin settings supporter key — viewer timezone', () => {
+	test.use({ timezoneId: 'Asia/Tokyo' });
+
+	test('the sign-in screen alone plants no operator cookie', async ({ page, context }) => {
+		// The cookie is the operator's, scoped to /admin — an anonymous visitor who
+		// only ever loads the sign-in screen must not get one.
+		await page.goto('/admin/login');
+		await expect(page.locator('input[type="password"]')).toBeVisible();
+
+		expect((await context.cookies()).find((c) => c.name === VIEWER_TZ_COOKIE)).toBeUndefined();
+	});
+
+	test('the browser publishes its zone and the server dates the key in it', async ({
+		page,
+		context
+	}) => {
+		await login(page);
+		// Reached by clicking the sidebar, NOT page.goto: the admin layout is reused
+		// across client-side navigation, so a mount-only cookie write would run just
+		// once — on the sign-in page, where it is skipped — and this would catch it.
+		await page.getByRole('link', { name: 'Settings' }).click();
+		await expect(page).toHaveURL(/\/admin\/settings/);
+		await openAccountTab(page);
+
+		// Written by the layout's effect, scoped to the admin area — never to public
+		// pages. The raw value is URI-encoded (the slash in an IANA zone);
+		// SvelteKit's cookies.get decodes it, which the date below then proves.
+		await expect(async () => {
+			const tz = (await context.cookies()).find((c) => c.name === VIEWER_TZ_COOKIE);
+			expect(tz).toMatchObject({ value: 'Asia%2FTokyo', path: '/admin' });
+		}).toPass();
+
+		await keyInput(page).fill(EXPIRED_TOKEN);
+		await saveButton(page).click();
+
+		// The server read the cookie: Tokyo's calendar day, not UTC's.
+		await expect(fieldError(page)).toContainText('2025.07.17');
 	});
 });

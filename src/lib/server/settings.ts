@@ -3,7 +3,7 @@ import { siteSettings } from './db/schema';
 import { APP_NAME } from '$lib/config';
 import { DEFAULT_GALLERY_SORT, isValidGallerySort, type GallerySort } from '$lib/gallery';
 import {
-	resolveSupporterKeyStatus,
+	supporterKeyStatusFromResult,
 	verifySupporterKey,
 	type SupporterKeyResult,
 	type SupporterKeyStatus
@@ -399,21 +399,12 @@ export async function setRawSetting(db: Database, key: string, value: string): P
 // can be written by another isolate, whose clearSupporterKeyStatusCache this one
 // never sees.
 //
-// The UTC day is part of the key because the TTL alone would carry a status
-// across midnight — and midnight UTC is exactly when this status changes. `exp`
-// is end-of-day UTC, so `daysRemaining` holds steady all day and a key expires
-// as the day rolls; without the day key an entry written at 23:59:50 would keep
-// saying "expires today" for a key that has already stopped working.
-//
-// One entry is shared by every request in the isolate, which is only sound while
-// the resolved status is the same for all of them. It is today: every field is
-// derived in UTC. Anything that makes the resolution depend on who is asking —
-// SONA-119 renders validUntil and counts daysRemaining in the viewer's zone —
-// has to either join the cache key or be applied to a zone-independent cached
-// value outside this memo, or one operator's dates get served to another.
-let supporterKeyStatusCache:
-	| { day: string; value: SupporterKeyStatus | null; expires: number }
-	| null = null;
+// SONA-119 made the resolved status viewer-dependent (validUntil and
+// daysRemaining are rendered in the operator's zone), so the status itself is
+// no longer cacheable in a shared entry — one operator's dates would be served
+// to another. What IS cached are the zone-independent verified facts below
+// (getVerifiedSupporterKey); the status is derived from them per call, which
+// still spares the hot path the D1 read and the Ed25519 verify.
 
 // Bumped by clearSupporterKeyStatusCache: a resolution that was already awaiting
 // the read when a save/remove cleared the entry must not re-cache its pre-write
@@ -449,9 +440,10 @@ export const NO_SUPPORTER_KEY: VerifiedSupporterKey = Object.freeze({
 // the status memo above does, and why SONA-119's viewer-zone rendering of the
 // STATUS fields cannot collide with it.
 //
-// The two memos could become one — every SupporterKeyStatus field is derivable
-// from these facts plus `now` — but that memo belongs to the change this one is
-// stacked on, so merging them is not this change's business.
+// This is the ONLY memo of the `supporterKey` row: the display status
+// (getSupporterKeyStatus below) is derived from these facts plus the caller's
+// `now` and zone on every call, exactly because those inputs are per-viewer
+// (SONA-119) while these facts are not.
 //
 // Staleness: the isolate running the save/remove clears immediately, others
 // converge on the TTL. A key that currently entitles is held for the full
@@ -476,7 +468,6 @@ let verifiedSupporterKeyCache: { value: VerifiedSupporterKey; expires: number } 
  * clear function, so an action can't invalidate one and miss the other.
  */
 export function clearSupporterKeyStatusCache() {
-	supporterKeyStatusCache = null;
 	verifiedSupporterKeyCache = null;
 	supporterKeyStatusGeneration++;
 }
@@ -535,20 +526,19 @@ function verifiedSupporterKeyFrom(res: SupporterKeyResult): VerifiedSupporterKey
  */
 export async function getSupporterKeyStatus(
 	db: Database,
-	now: Date
+	now: Date,
+	timeZone: string
 ): Promise<SupporterKeyStatus | null> {
-	const day = now.toISOString().slice(0, 10);
-	const cached = supporterKeyStatusCache;
-	if (cached && cached.day === day && cached.expires > Date.now()) {
-		return cached.value;
-	}
-	const startedIn = supporterKeyStatusGeneration;
-	const token = await getRawSetting(db, 'supporterKey');
-	const value = await resolveSupporterKeyStatus(token ?? '', now);
-	if (supporterKeyStatusGeneration === startedIn) {
-		supporterKeyStatusCache = { day, value, expires: Date.now() + SETTINGS_TTL_MS };
-	}
-	return value;
+	const key = await getVerifiedSupporterKey(db);
+	if (!key.signatureValid) return null;
+	// Re-shape the cached facts as the verify result they came from; login/tier
+	// are not part of the facts and the status never renders them.
+	const expiresAt = new Date(key.expiresAt);
+	const res: SupporterKeyResult =
+		now.getTime() >= key.expiresAt
+			? { valid: false, reason: 'expired', login: '', tier: 0, expiresAt }
+			: { valid: true, login: '', tier: 0, expiresAt };
+	return supporterKeyStatusFromResult(res, now, timeZone);
 }
 
 export async function saveSettings(db: Database, settings: Partial<SiteSettings>) {

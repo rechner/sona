@@ -268,33 +268,33 @@ describe('getSupporterKeyStatus — caching', () => {
 		const { db, state } = fakeKeyDb('head.tail');
 		const now = new Date('2026-08-25T09:00:00Z');
 
-		const first = await getSupporterKeyStatus(db, now);
-		const second = await getSupporterKeyStatus(db, new Date('2026-08-25T18:30:00Z'));
+		const first = await getSupporterKeyStatus(db, now, 'UTC');
+		const second = await getSupporterKeyStatus(db, new Date('2026-08-25T18:30:00Z'), 'UTC');
 
 		expect(second).toEqual(first);
 		expect(state.reads).toBe(1);
 		expect(verifySupporterKey).toHaveBeenCalledTimes(1);
 	});
 
-	it('re-resolves across midnight UTC even well inside the TTL', async () => {
-		// The day key's whole job: the 60s TTL would otherwise carry a status over
-		// the boundary where it changes. An entry written at 23:59:50 on the last
-		// covered day would keep saying "expires today" for a key that has already
-		// stopped working — so these two calls are 20 seconds apart.
+	it('rolls the derived status across midnight without a re-read', async () => {
+		// The status is derived from the cached zone-independent facts on every
+		// call (SONA-119), so crossing midnight updates daysRemaining immediately —
+		// no day-keyed cache entry, and no extra D1 read, is needed for it.
 		vi.useFakeTimers();
 		stubValidKey();
 		const { db, state } = fakeKeyDb('head.tail');
 
 		// 6 days + 10s left of a key that expires end-of-day on the 31st → 7.
 		vi.setSystemTime(new Date('2026-08-25T23:59:50Z'));
-		const before = await getSupporterKeyStatus(db, new Date('2026-08-25T23:59:50Z'));
+		const before = await getSupporterKeyStatus(db, new Date('2026-08-25T23:59:50Z'), 'UTC');
 		expect(before).toMatchObject({ daysRemaining: 7 });
 
 		vi.setSystemTime(new Date('2026-08-26T00:00:10Z'));
-		const after = await getSupporterKeyStatus(db, new Date('2026-08-26T00:00:10Z'));
+		const after = await getSupporterKeyStatus(db, new Date('2026-08-26T00:00:10Z'), 'UTC');
 
 		expect(after).toMatchObject({ daysRemaining: 6 });
-		expect(state.reads).toBe(2);
+		// One read: the verified-facts memo is still warm; only the derivation moved.
+		expect(state.reads).toBe(1);
 	});
 
 	it('re-reads after the TTL expires, so a key written by another isolate lands', async () => {
@@ -305,15 +305,17 @@ describe('getSupporterKeyStatus — caching', () => {
 		stubValidKey();
 		const { db, state } = fakeKeyDb(null);
 
-		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:00Z'))).toBeNull();
+		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:00Z'), 'UTC')).toBeNull();
 
 		state.value = 'head.tail';
-		// Still inside the 60s TTL → the stale "no key" answer stands.
-		vi.setSystemTime(new Date('2026-08-25T09:00:59Z'));
-		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:59Z'))).toBeNull();
+		// Still inside the short no-key TTL → the stale "no key" answer stands.
+		// (A non-entitling answer is held for seconds, not the full settings TTL,
+		// exactly so an installed or renewed key lands quickly on warm isolates.)
+		vi.setSystemTime(new Date('2026-08-25T09:00:04Z'));
+		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:04Z'), 'UTC')).toBeNull();
 
-		vi.setSystemTime(new Date('2026-08-25T09:01:01Z'));
-		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:01:01Z'))).toMatchObject({
+		vi.setSystemTime(new Date('2026-08-25T09:00:06Z'));
+		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:06Z'), 'UTC')).toMatchObject({
 			state: 'valid'
 		});
 		expect(state.reads).toBe(2);
@@ -324,12 +326,12 @@ describe('getSupporterKeyStatus — caching', () => {
 		stubValidKey();
 		const { db, state } = fakeKeyDb(null);
 		const now = new Date('2026-08-25T09:00:00Z');
-		expect(await getSupporterKeyStatus(db, now)).toBeNull();
+		expect(await getSupporterKeyStatus(db, now, 'UTC')).toBeNull();
 
 		state.value = 'head.tail';
 		clearSupporterKeyStatusCache();
 
-		expect(await getSupporterKeyStatus(db, now)).toMatchObject({ state: 'valid' });
+		expect(await getSupporterKeyStatus(db, now, 'UTC')).toMatchObject({ state: 'valid' });
 		expect(state.reads).toBe(2);
 	});
 
@@ -341,19 +343,19 @@ describe('getSupporterKeyStatus — caching', () => {
 		const { db, state } = fakeKeyDb(null);
 		const now = new Date('2026-08-25T09:00:00Z');
 
-		const inFlight = getSupporterKeyStatus(db, now);
+		const inFlight = getSupporterKeyStatus(db, now, 'UTC');
 		clearSupporterKeyStatusCache(); // what saveSupporterKey does mid-flight
 		expect(await inFlight).toBeNull();
 
 		state.value = 'head.tail';
-		expect(await getSupporterKeyStatus(db, now)).toMatchObject({ state: 'valid' });
+		expect(await getSupporterKeyStatus(db, now, 'UTC')).toMatchObject({ state: 'valid' });
 		expect(state.reads).toBe(2);
 	});
 
 	it('resolves an absent key to null without verifying', async () => {
 		const { db } = fakeKeyDb(null);
 
-		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:00Z'))).toBeNull();
+		expect(await getSupporterKeyStatus(db, new Date('2026-08-25T09:00:00Z'), 'UTC')).toBeNull();
 		expect(verifySupporterKey).not.toHaveBeenCalled();
 	});
 
@@ -362,10 +364,10 @@ describe('getSupporterKeyStatus — caching', () => {
 		// failure would turn one transient error into a minute of missing notice.
 		stubValidKey();
 		const now = new Date('2026-08-25T09:00:00Z');
-		await expect(getSupporterKeyStatus(throwingKeyDb(), now)).rejects.toThrow('D1 unavailable');
+		await expect(getSupporterKeyStatus(throwingKeyDb(), now, 'UTC')).rejects.toThrow('D1 unavailable');
 
 		const { db, state } = fakeKeyDb('head.tail');
-		expect(await getSupporterKeyStatus(db, now)).toMatchObject({ state: 'valid' });
+		expect(await getSupporterKeyStatus(db, now, 'UTC')).toMatchObject({ state: 'valid' });
 		expect(state.reads).toBe(1);
 	});
 });
