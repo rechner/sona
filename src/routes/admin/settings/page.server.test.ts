@@ -19,7 +19,7 @@ import { MAX_SONA_COLORS } from '$lib/palette-merge';
 import { DEFAULT_THEME_ID } from '$lib/themes';
 import { DEFAULT_LANDING_LAYOUT } from '$lib/landing';
 import { resolveAvatarUrl } from '$lib/server/avatar';
-import { verifySupporterKey } from '$lib/server/supporter-key';
+import { verifySupporterKey, supporterKeyDisplayRecord } from '$lib/server/supporter-key';
 import { earlyAccessActive } from '$lib/early-access';
 import { formatDate } from '$lib/index';
 import { actions, load } from './+page.server';
@@ -1055,15 +1055,17 @@ describe('settings load — supporter key is raw + verified, never in public set
 		});
 
 		const result = (await load({ platform, url: LOAD_URL } as never)) as unknown as {
-			supporterKey: { token: string; state: string; validUntil: string } | null;
+			supporterKey: { keyRecord: string; state: string; validUntil: string } | null;
 			earlyAccess: unknown[];
 			settings: Record<string, unknown>;
 		};
 
 		// Exact shape on purpose: any NEW field added to the payload must be
-		// re-reviewed here before it rides to the client alongside the token.
+		// re-reviewed here before it rides to the client. 'head.tail' is under the
+		// masking threshold, so it passes through — the mask itself is covered in
+		// supporter-key.test.ts and the "never ships the full token" test below.
 		expect(result.supporterKey).toEqual({
-			token: 'head.tail',
+			keyRecord: 'head.tail',
 			state: 'valid',
 			validUntil: '2026.08.31',
 			daysRemaining: expect.any(Number),
@@ -1108,6 +1110,40 @@ describe('settings load — supporter key is raw + verified, never in public set
 		};
 
 		expect(result.supporterKey).toBeNull();
+	});
+
+	// Source pin: the card is the only thing that ever displayed the key, and the
+	// unit tests above cover the load payload, not the rendered document. Rendering
+	// it for real needs a key signed by the sona.fast issuer, which tests can't
+	// have — so pin the template instead. Reintroducing any client-side truncation
+	// means the full token is being shipped again.
+	it('the settings card renders the server-made mask, not a token it truncates', () => {
+		const src = readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+		expect(src).toContain('data.supporterKey.keyRecord');
+		expect(src).not.toMatch(/supporterKey\.token|truncateKey/);
+	});
+
+	it('ships the mask and never the stored token, anywhere in the payload', async () => {
+		// The page used to send the whole signed key and truncate at render, which
+		// put a working key in the SSR payload and the client bundle. Scanning the
+		// SERIALIZED payload is the check that survives a refactor: any field that
+		// carries the token back — under any name — fails here.
+		const token = `${'a'.repeat(60)}.${'b'.repeat(86)}`;
+		const { db, platform } = makeLoadDb();
+		await setRawSetting(db, 'supporterKey', token);
+		vi.mocked(verifySupporterKey).mockResolvedValueOnce({
+			valid: true,
+			login: 'sparky',
+			tier: 2,
+			expiresAt: new Date('2026-09-01T00:00:00Z')
+		});
+
+		const result = (await load({ platform, url: LOAD_URL } as never)) as unknown as {
+			supporterKey: { keyRecord: string } | null;
+		};
+
+		expect(result.supporterKey?.keyRecord).toBe(supporterKeyDisplayRecord(token));
+		expect(JSON.stringify(result)).not.toContain(token);
 	});
 });
 

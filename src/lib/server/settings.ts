@@ -2,7 +2,12 @@ import { eq, inArray } from 'drizzle-orm';
 import { siteSettings } from './db/schema';
 import { APP_NAME } from '$lib/config';
 import { DEFAULT_GALLERY_SORT, isValidGallerySort, type GallerySort } from '$lib/gallery';
-import { resolveSupporterKeyStatus, type SupporterKeyStatus } from './supporter-key';
+import {
+	resolveSupporterKeyStatus,
+	verifySupporterKey,
+	type SupporterKeyResult,
+	type SupporterKeyStatus
+} from './supporter-key';
 import type { Database } from './db';
 
 export type StorageProviderId = 'uploadthing' | 'r2';
@@ -415,13 +420,113 @@ let supporterKeyStatusCache:
 // status. Same guard as the nav probes (cachedProbe in nav-gating.ts).
 let supporterKeyStatusGeneration = 0;
 
+/**
+ * What verifying the stored key established about it: whether the issuer's
+ * signature checks out, and — when it does — the unix ms instant the key stops
+ * working. A union rather than two loose fields, so the two can't drift apart
+ * and a caller that checks the signature needs no null check after it. Frozen:
+ * callers share one instance.
+ */
+export type VerifiedSupporterKey =
+	| { readonly signatureValid: true; readonly expiresAt: number }
+	| { readonly signatureValid: false; readonly expiresAt: null };
+
+/** The fail-closed answer: no key, or nothing that verified as one. Exported so
+ * callers that degrade to "no key" name the same thing the memo does. */
+export const NO_SUPPORTER_KEY: VerifiedSupporterKey = Object.freeze({
+	signatureValid: false,
+	expiresAt: null
+});
+
+// The second memo of the `supporterKey` row, for the ENFORCEMENT path
+// (vrPublishingEnabled), which runs on every VR admin load and every model
+// upload and otherwise pays a D1 read plus an Ed25519 verify each time.
+//
+// THE INVARIANT, stated once for everything below: nothing cached here depends
+// on `now` or on who is asking. Only the signature verdict and the expiry
+// instant are stored; validity is that pair compared against the caller's own
+// `now`, re-decided per call. That is why this memo needs no UTC-day key where
+// the status memo above does, and why SONA-119's viewer-zone rendering of the
+// STATUS fields cannot collide with it.
+//
+// The two memos could become one — every SupporterKeyStatus field is derivable
+// from these facts plus `now` — but that memo belongs to the change this one is
+// stacked on, so merging them is not this change's business.
+//
+// Staleness: the isolate running the save/remove clears immediately, others
+// converge on the TTL. A key that currently entitles is held for the full
+// SETTINGS_TTL_MS, so REMOVING one keeps publishing open elsewhere for up to a
+// minute — the same bound the settings and status caches already accept, and
+// only the owner revoking their own entitlement can reach it.
+//
+// Everything that does NOT entitle right now — no row, nothing that verified,
+// and a lapsed key — is held for seconds instead. That is the direction where
+// staleness looks like a bug: the operator installs or renews a key, the
+// settings page (which reads uncached) says valid, and a warm isolate would
+// otherwise keep refusing uploads. Renewal is the common case, since keys run
+// ~45 days, and a renewal replaces a LAPSED entry — which is why the short TTL
+// keys off "usable now" rather than "signature ok".
+const NO_KEY_TTL_MS = 5_000;
+let verifiedSupporterKeyCache: { value: VerifiedSupporterKey; expires: number } | null = null;
+
+/**
+ * The single invalidation hook for EVERY memo of the `supporterKey` row — the
+ * display status and the verified-key facts alike. Both save/remove actions
+ * call it once; a new memo of that row belongs here rather than in its own
+ * clear function, so an action can't invalidate one and miss the other.
+ */
 export function clearSupporterKeyStatusCache() {
 	supporterKeyStatusCache = null;
+	verifiedSupporterKeyCache = null;
 	supporterKeyStatusGeneration++;
 }
 
 /**
- * Read and verify the stored supporter key, memoized as described above.
+ * The verified FACTS about the stored key, for the enforcement gate — memoized
+ * under the invariant above.
+ *
+ * Fails closed on every uncertain outcome: a token that doesn't verify, a
+ * missing row and an empty row all resolve to NO_SUPPORTER_KEY. D1 errors
+ * propagate (and are not cached) so the caller can decide — the enforcement
+ * path catches them and denies.
+ */
+export async function getVerifiedSupporterKey(db: Database): Promise<VerifiedSupporterKey> {
+	const cached = verifiedSupporterKeyCache;
+	if (cached && cached.expires > Date.now()) return cached.value;
+	const startedIn = supporterKeyStatusGeneration;
+	const token = await getRawSetting(db, 'supporterKey');
+	// `now` only picks which arm of the result carries the expiry, and both arms
+	// that carry one fold to the same facts — so nothing about WHEN this ran
+	// reaches the cache.
+	const value = token
+		? verifiedSupporterKeyFrom(await verifySupporterKey(token, new Date()))
+		: NO_SUPPORTER_KEY;
+	// A resolution that a save/remove overtook must not re-cache its pre-write
+	// answer — same guard, and the same counter, as the status memo.
+	if (supporterKeyStatusGeneration === startedIn) {
+		// Only the entry's LIFETIME is time-relative; the value it holds still is
+		// not, so the invariant above is intact.
+		const entitlesNow = value.signatureValid && value.expiresAt > Date.now();
+		verifiedSupporterKeyCache = {
+			value,
+			expires: Date.now() + (entitlesNow ? SETTINGS_TTL_MS : NO_KEY_TTL_MS)
+		};
+	}
+	return value;
+}
+
+/** Keep the expiry of anything the issuer actually signed — the `expired` arm
+ * carries a trustworthy `expiresAt` too, and that is what lets one entry answer
+ * correctly on both sides of the moment a key lapses. */
+function verifiedSupporterKeyFrom(res: SupporterKeyResult): VerifiedSupporterKey {
+	if (res.valid || res.reason === 'expired') {
+		return Object.freeze({ signatureValid: true, expiresAt: res.expiresAt.getTime() });
+	}
+	return NO_SUPPORTER_KEY;
+}
+
+/**
+ * The stored key's DISPLAY status, for the admin layout's expiry notice.
  *
  * D1 errors propagate and are not cached, so a transient failure doesn't stick.
  * The admin layout catches them to degrade just its notice; the settings page
