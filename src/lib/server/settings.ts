@@ -2,6 +2,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { siteSettings } from './db/schema';
 import { APP_NAME } from '$lib/config';
 import { DEFAULT_GALLERY_SORT, isValidGallerySort, type GallerySort } from '$lib/gallery';
+import { resolveSupporterKeyStatus, type SupporterKeyStatus } from './supporter-key';
 import type { Database } from './db';
 
 export type StorageProviderId = 'uploadthing' | 'r2';
@@ -382,6 +383,67 @@ export async function setRawSetting(db: Database, key: string, value: string): P
 	} else {
 		await db.insert(siteSettings).values({ key, value });
 	}
+}
+
+// Resolved supporter-key status, memoized per isolate next to the settings cache
+// above (SONA-118). The admin layout load runs this on every authenticated admin
+// page request; uncached it costs a D1 read of the `supporterKey` row plus an
+// Ed25519 verify each time.
+//
+// SETTINGS_TTL_MS bounds the same staleness it bounds for settings: the key row
+// can be written by another isolate, whose clearSupporterKeyStatusCache this one
+// never sees.
+//
+// The UTC day is part of the key because the TTL alone would carry a status
+// across midnight — and midnight UTC is exactly when this status changes. `exp`
+// is end-of-day UTC, so `daysRemaining` holds steady all day and a key expires
+// as the day rolls; without the day key an entry written at 23:59:50 would keep
+// saying "expires today" for a key that has already stopped working.
+//
+// One entry is shared by every request in the isolate, which is only sound while
+// the resolved status is the same for all of them. It is today: every field is
+// derived in UTC. Anything that makes the resolution depend on who is asking —
+// SONA-119 renders validUntil and counts daysRemaining in the viewer's zone —
+// has to either join the cache key or be applied to a zone-independent cached
+// value outside this memo, or one operator's dates get served to another.
+let supporterKeyStatusCache:
+	| { day: string; value: SupporterKeyStatus | null; expires: number }
+	| null = null;
+
+// Bumped by clearSupporterKeyStatusCache: a resolution that was already awaiting
+// the read when a save/remove cleared the entry must not re-cache its pre-write
+// status. Same guard as the nav probes (cachedProbe in nav-gating.ts).
+let supporterKeyStatusGeneration = 0;
+
+export function clearSupporterKeyStatusCache() {
+	supporterKeyStatusCache = null;
+	supporterKeyStatusGeneration++;
+}
+
+/**
+ * Read and verify the stored supporter key, memoized as described above.
+ *
+ * D1 errors propagate and are not cached, so a transient failure doesn't stick.
+ * The admin layout catches them to degrade just its notice; the settings page
+ * deliberately does NOT use this — it reads and verifies loudly on every
+ * request so a D1 error there can never render as "no key".
+ */
+export async function getSupporterKeyStatus(
+	db: Database,
+	now: Date
+): Promise<SupporterKeyStatus | null> {
+	const day = now.toISOString().slice(0, 10);
+	const cached = supporterKeyStatusCache;
+	if (cached && cached.day === day && cached.expires > Date.now()) {
+		return cached.value;
+	}
+	const startedIn = supporterKeyStatusGeneration;
+	const token = await getRawSetting(db, 'supporterKey');
+	const value = await resolveSupporterKeyStatus(token ?? '', now);
+	if (supporterKeyStatusGeneration === startedIn) {
+		supporterKeyStatusCache = { day, value, expires: Date.now() + SETTINGS_TTL_MS };
+	}
+	return value;
 }
 
 export async function saveSettings(db: Database, settings: Partial<SiteSettings>) {
