@@ -3,7 +3,7 @@ import { sequence } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
 import { getDb } from '$lib/server/db';
 import { sessions } from '$lib/server/db/schema';
-import { isSetupComplete, hashToken } from '$lib/server/admin-auth';
+import { getSetupState, hashToken } from '$lib/server/admin-auth';
 import { getSettings } from '$lib/server/settings';
 import {
 	metricUpsert,
@@ -77,20 +77,62 @@ export const authHandle: Handle = async ({ event, resolve }) => {
 		event.locals.admin = false;
 	}
 
-	// First-run setup gate. Until an admin credential exists, force every request
-	// to the setup wizard — a freshly deployed fork must not be browsable or
-	// admin-able before its owner has claimed it. Assets and the wizard itself are
-	// exempt. isSetupComplete caches the positive result, so this is a no-op (no
-	// query) once the site is configured. Fails toward setup, never toward an open
-	// admin (see admin-auth.ts).
+	// First-run setup gate, in three cases. Assets and the wizard itself are exempt
+	// (so the gate never sees /admin/setup — that route guards itself; see below).
+	// getSetupState caches the positive, so this is a no-op (no query) once the
+	// site is configured.
+	//
+	//   complete   → through.
+	//   incomplete → the wizard, for everything. A freshly deployed fork must not
+	//                be browsable or admin-able before its owner has claimed it.
+	//   unknown    → the read FAILED, so we know nothing. Public routes serve;
+	//                /admin and /api stay shut.
+	//
+	// That last case is the one that changed (SONA-186). It used to collapse into
+	// 'incomplete', which meant one failed read on a cold isolate showed a setup
+	// wizard to every visitor of an established public gallery until a read
+	// succeeded. Fail-closed was right about WHERE the risk is and wrong about
+	// where the cost lands: an unclaimed fork has no content to leak through its
+	// public routes, so serving a degraded page beats redirecting a live site
+	// into someone else's setup screen.
+	//
+	// What actually stops a takeover during a blip is the setup ACTION, which
+	// refuses when it cannot read the setup state, plus the mandatory SETUP_TOKEN
+	// (see admin/setup/+page.server.ts). The 503 below is not that guard — note
+	// that /admin/setup is exempt here, so the wizard renders during an outage
+	// exactly as it did before. The 503 keeps the REST of the admin panel shut.
 	const path = event.url.pathname;
 	const isSetupRoute = path === '/admin/setup' || path.startsWith('/admin/setup/');
 	const isAsset = path.startsWith('/_app/') || path === '/favicon.ico' || path === '/favicon.png';
 	if (event.platform?.env.DB && !isSetupRoute && !isAsset) {
 		const db = getDb(event.platform.env.DB);
-		if (!(await isSetupComplete(db, event.platform.env))) {
-			if (path.startsWith('/api')) return new Response('Setup required', { status: 503 });
-			throw redirect(302, '/admin/setup');
+		const state = await getSetupState(db, event.platform.env);
+		switch (state) {
+			case 'complete':
+				break;
+			case 'incomplete':
+				if (path.startsWith('/api')) return new Response('Setup required', { status: 503 });
+				throw redirect(302, '/admin/setup');
+			case 'unknown':
+				// 'unknown' is also what a fork whose D1 migrations never ran looks
+				// like, so name that — otherwise its owner gets a bare 503 with no
+				// way forward.
+				if (path.startsWith('/admin') || path.startsWith('/api')) {
+					// Retry-After says the state is transient rather than terminal. This
+					// branch returns early, so it never reaches the header block at the
+					// bottom of the handler — hence the explicit no-store.
+					return new Response(
+						'Setup state unavailable. If this is a new deployment, apply the D1 migrations.',
+						{
+							status: 503,
+							headers: { 'Retry-After': '30', 'Cache-Control': 'private, no-store, no-cache' }
+						}
+					);
+				}
+				break;
+			default:
+				// A new SetupState must not fall through into "serve everything".
+				throw new Error(`unhandled setup state: ${state satisfies never}`);
 		}
 	}
 
