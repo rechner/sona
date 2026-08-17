@@ -50,6 +50,10 @@ describe('buildRule', () => {
 		expect(rule.expression).toBe(RULE_EXPRESSION);
 		expect(rule.ref).toBe(RULE_REF);
 		expect(rule.description).toBe(RULE_DESCRIPTION);
+		// Free requires a 10s period and a mitigation timeout equal to it (and one
+		// rule per zone — see RULE_EXPRESSION); cf.colo.id is required outside
+		// Enterprise. Drifting from any of these makes the rule unappliable. The
+		// beacon threshold is unchanged now that oEmbed shares the rule.
 		expect(rule.ratelimit).toEqual({
 			characteristics: ['ip.src', 'cf.colo.id'],
 			period: 10,
@@ -58,9 +62,13 @@ describe('buildRule', () => {
 		});
 	});
 
-	it('targets exactly POST /api/metrics/download', () => {
+	it('targets exactly the two gate-exempt public paths, in one rule', () => {
+		// One rule for the reason documented on RULE_EXPRESSION (Free plan). Each
+		// clause is method-scoped so the rule can't be tripped by a verb the app
+		// doesn't serve — and /api/oembed lists HEAD as well as GET, because
+		// SvelteKit runs its GET handler for HEAD (same two D1 reads).
 		expect(RULE_EXPRESSION).toBe(
-			'(http.request.method eq "POST" and http.request.uri.path eq "/api/metrics/download")'
+			'((http.request.method eq "POST" and http.request.uri.path eq "/api/metrics/download") or ((http.request.method eq "GET" or http.request.method eq "HEAD") and http.request.uri.path eq "/api/oembed"))'
 		);
 	});
 });
@@ -169,6 +177,41 @@ describe('applyDownloadRateLimit — idempotent no-op', () => {
 		expect(patch?.body).toMatchObject({ ratelimit: RULE_RATELIMIT });
 		// No duplicate append.
 		expect(calls.some((c) => c.method === 'POST')).toBe(false);
+	});
+
+	it('migrates the download-only rule the deployed forks actually hold', async () => {
+		// This is the shape on all six live forks: our `ref`, current rate-limit
+		// params, but the pre-SONA-168 download-only expression (written literally so
+		// the test still describes production even after RULE_EXPRESSION changes).
+		const deployedRule = {
+			id: 'mine',
+			ref: RULE_REF,
+			description: RULE_DESCRIPTION,
+			action: 'block',
+			enabled: true,
+			expression:
+				'(http.request.method eq "POST" and http.request.uri.path eq "/api/metrics/download")',
+			ratelimit: { ...RULE_RATELIMIT }
+		};
+		const { api, calls } = fakeApi({
+			[zonePath]: zoneOk,
+			[entryPath]: { ok: true, status: 200, result: { id: RULESET, rules: [deployedRule] } },
+			[`PATCH /zones/${ZONE}/rulesets/${RULESET}/rules/mine`]: { ok: true, status: 200 }
+		});
+		const res = await applyDownloadRateLimit(SECRET, 'akito.dog', api);
+		expect(res.status).toBe('updated');
+
+		const patch = calls.find((c) => c.method === 'PATCH');
+		expect(patch?.path).toBe(`/zones/${ZONE}/rulesets/${RULESET}/rules/mine`);
+		expect((patch?.body as { expression: string }).expression).toBe(RULE_EXPRESSION);
+
+		// And the patched shape is what a re-run recognises: the migration converges.
+		const patched = { ...deployedRule, ...(patch?.body as Record<string, unknown>) };
+		const rerun = fakeApi({
+			[zonePath]: zoneOk,
+			[entryPath]: { ok: true, status: 200, result: { id: RULESET, rules: [patched] } }
+		});
+		expect((await applyDownloadRateLimit(SECRET, 'akito.dog', rerun.api)).status).toBe('exists');
 	});
 });
 

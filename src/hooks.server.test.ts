@@ -28,10 +28,14 @@ function makeDb(): D1Database {
 
 // No session cookie — cookies.get returns undefined for every key, so the request
 // is unauthenticated (locals.admin = false).
-function makeEvent(pathname: string, db: D1Database) {
+function makeEvent(pathname: string, db: D1Database, method = 'GET') {
+	const url = new URL(`https://taro.surf${pathname}`);
 	return {
 		cookies: { get: () => undefined },
-		url: new URL(`https://taro.surf${pathname}`),
+		url,
+		// The gate reads the method for the /api/oembed exemption, so events carry a
+		// real Request. Defaults to GET, which is what every other case here implies.
+		request: new Request(url, { method }),
 		locals: {} as App.Locals,
 		platform: { env: { DB: db } } as unknown as App.Platform
 	} as never;
@@ -180,7 +184,7 @@ describe('authHandle — /api/admin/ref-image stays behind the admin gate', () =
 	});
 });
 
-describe('authHandle — /api/metrics/download is the only other public /api route', () => {
+describe('authHandle — /api/metrics/download is public', () => {
 	it('reaches the endpoint without a session (an anonymous visitor pressed download)', async () => {
 		vi.mocked(isSetupComplete).mockResolvedValue(true);
 
@@ -198,6 +202,60 @@ describe('authHandle — /api/metrics/download is the only other public /api rou
 		vi.mocked(isSetupComplete).mockResolvedValue(true);
 
 		for (const path of ['/api/metrics', '/api/metrics/download/extra', '/api/metrics/other']) {
+			const res = (await authHandle({
+				event: makeEvent(path, makeDb()),
+				resolve
+			} as never)) as Response;
+			expect(res.status, `${path} must stay behind the admin gate`).toBe(401);
+		}
+	});
+});
+
+describe('authHandle — /api/oembed is public (third-party embedders have no session)', () => {
+	it('reaches the endpoint without a session (a link preview is fetched anonymously)', async () => {
+		vi.mocked(isSetupComplete).mockResolvedValue(true);
+
+		// HEAD as well as GET: SvelteKit runs the GET handler for HEAD when no HEAD is
+		// exported, so a HEAD does the same work and must be exempt for the same reason.
+		for (const method of ['GET', 'HEAD']) {
+			const res = (await authHandle({
+				event: makeEvent('/api/oembed', makeDb(), method),
+				resolve
+			} as never)) as Response;
+
+			// Not 401: the gate let it through to the endpoint, which validates the url
+			// param and filters on `published` itself.
+			expect(res.status, method).not.toBe(401);
+		}
+	});
+
+	it('does not exempt write methods — a POST handler added later must not be public', async () => {
+		vi.mocked(isSetupComplete).mockResolvedValue(true);
+
+		// The route exports only GET today, so SvelteKit answers these with a 405
+		// before endpoint code runs. That safety lives in another file, though: this
+		// asserts the GATE itself refuses them, so adding a POST handler to the
+		// endpoint cannot silently make it anonymously writable.
+		for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+			const res = (await authHandle({
+				event: makeEvent('/api/oembed', makeDb(), method),
+				resolve
+			} as never)) as Response;
+
+			expect(res.status, `${method} /api/oembed must stay behind the admin gate`).toBe(401);
+		}
+	});
+
+	it('does not exempt sibling paths — a prefix match would open the whole namespace', async () => {
+		vi.mocked(isSetupComplete).mockResolvedValue(true);
+
+		// '/api/%6Fembed' pins the encoding case as DEFENSE IN DEPTH, not as production
+		// behaviour: the hook compares the RAW pathname while SvelteKit's router decodes
+		// per-segment. In production, Cloudflare URL normalization (scope `incoming`,
+		// enabled on every fork zone) decodes the path before the Worker sees it, so a
+		// real request spelled this way arrives as '/api/oembed' and is served. This
+		// asserts the hook still fails closed on a zone with normalization turned off.
+		for (const path of ['/api/oembed/extra', '/api/oembedx', '/api/%6Fembed']) {
 			const res = (await authHandle({
 				event: makeEvent(path, makeDb()),
 				resolve

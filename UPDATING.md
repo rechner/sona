@@ -80,6 +80,45 @@ Page manually with `?afterId=<lastId>` from each response until `rasters` comes
 back below the limit. Stickers imported after the upgrade are sniffed at import
 time and need nothing.
 
+## One-time per fork: re-apply the WAF rate-limit rule (oEmbed)
+
+The release that adds the oEmbed provider (`/api/oembed`) makes a second `/api`
+path reachable without an admin session, and widens the WAF rate-limit rule to
+cover it. New forks get the widened rule from `npm run setup`; a fork that was
+**already deployed** still has the older download-only rule, so until you re-apply
+it the oEmbed endpoint is anonymous with no rate limit.
+
+Run this once per fork, from a clone:
+
+```sh
+CLOUDFLARE_API_TOKEN=<token> npm run apply-download-ratelimit -- <domain>
+```
+
+`<domain>` is your site domain (e.g. `akito.dog`). The token needs one permission,
+**Zone · WAF · Edit**, on a token whose Zone Resources include that domain; it is
+read from the environment and never printed. The command is idempotent — the first
+run reports `updated`, any re-run reports `exists` — so it is safe to repeat if
+you're unsure whether it already ran.
+
+> **Serving on `*.pages.dev`?** Then your site has no Cloudflare zone, and a
+> rate-limiting rule cannot be applied at all. Nothing to run; the endpoint is
+> unprotected until the site moves to a custom domain.
+
+The rule blocks an address for 10 seconds once it makes 20 matching requests in
+10 seconds, counted per Cloudflare data centre. Link-preview services fetch from
+shared addresses, so roughly twenty-odd of your links pasted into one chat
+channel at once can trip it. The previews that miss show no image rather than an
+error, and they come back on the next paste.
+
+**Your link previews also change on this release** if your images are hosted off
+your own Cloudflare zone — UploadThing (the default), a `*.r2.dev` bucket, or an
+R2 custom domain on a different zone. Those previews pointed at a resized URL
+your zone refuses to serve, so they showed no image at all; they now point at the
+original file, which does load. The tradeoff is that the original is full size,
+and some services cap how large a preview they will fetch. Sites whose images sit
+on their own zone (`cdn.yoursite.com`) are unaffected and keep the resized
+version.
+
 ## Read before upgrading: your site gains an AI disclosure page (SONA-167)
 
 This release adds a public page at `/ai`, linked from your footer. **Sites that

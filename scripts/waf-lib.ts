@@ -1,8 +1,8 @@
 /**
- * Cloudflare WAF rate-limit provisioning for the download-metrics beacon
- * (POST /api/metrics/download). Applies a zone-level rate-limit rule capping how
- * often a single IP can hit the beacon, so the counter stays cheap to run,
- * without touching any other WAF rule on the zone.
+ * Cloudflare WAF rate-limit provisioning for the anonymously-reachable /api paths
+ * (POST /api/metrics/download, GET/HEAD /api/oembed). Applies ONE zone-level
+ * rate-limit rule capping how often a single IP can hit them — one, for the reason
+ * documented on RULE_EXPRESSION — without touching any other WAF rule on the zone.
  *
  * The core `applyDownloadRateLimit` is shared by two callers: the fork setup CLI
  * (scripts/setup.ts, for future forks) and the standalone runner
@@ -37,16 +37,35 @@ function zoneNameCandidates(host: string): string[] {
  * dashboard. Both are stable — do not change `ref` or old rules become orphans.
  */
 export const RULE_REF = 'sona_download_beacon_ratelimit';
-export const RULE_DESCRIPTION = 'sona: download beacon rate limit';
-
-/** Matches exactly the beacon route: POST /api/metrics/download (see +server.ts). */
-export const RULE_EXPRESSION =
-	'(http.request.method eq "POST" and http.request.uri.path eq "/api/metrics/download")';
+export const RULE_DESCRIPTION = 'sona: public endpoint rate limit';
 
 /**
- * Rate-limit knobs: at most 20 POSTs per 10s from one IP, then that IP is blocked
- * for 10s. Generous enough that a real visitor mashing download never trips it,
- * tight enough that a scripted loop is throttled to a trickle.
+ * Matches every /api path that is exempt from the admin gate in hooks.server.ts and
+ * therefore reachable anonymously:
+ *   - POST     /api/metrics/download — the download beacon (see its +server.ts).
+ *   - GET/HEAD /api/oembed           — the oEmbed provider (SONA-168). HEAD is in
+ *     because SvelteKit runs the GET handler for HEAD when no HEAD is exported, so
+ *     a HEAD does the same two D1 reads a GET does. Written as two `eq`s joined by
+ *     `or` rather than `in {"GET" "HEAD"}`: the docs confirm space-separated set
+ *     literals but not the quoted-string form, and this rule is applied unattended
+ *     across the fleet — `eq`/`or` is syntax the deployed rule already proves.
+ *
+ * ONE rule covers both because the Free plan allows exactly ONE rate-limiting rule
+ * per zone, and every fork runs on Free. A second rule is not "extra config" there
+ * — the API rejects it. So when a new /api path is exempted from the gate, extend
+ * this expression; do NOT add a rule. The counter is shared across the paths, which
+ * is fine: they are matched per-IP and no real client hits both in the same window.
+ */
+export const RULE_EXPRESSION =
+	'((http.request.method eq "POST" and http.request.uri.path eq "/api/metrics/download") or ((http.request.method eq "GET" or http.request.method eq "HEAD") and http.request.uri.path eq "/api/oembed"))';
+
+/**
+ * Rate-limit knobs: at most 20 matching requests per 10s from one IP, then that IP
+ * is blocked for 10s. Generous enough that a real visitor mashing download never
+ * trips it, tight enough that a scripted loop is throttled to a trickle. Kept at 20
+ * when /api/oembed joined the rule, with the failure mode that buys: unfurl services
+ * share egress IPs, so ~21 links pasted into one channel within 10s from a single
+ * colo trip the block, and the consumer silently caches the failed preview.
  *
  * `cf.colo.id` is REQUIRED alongside `ip.src`: outside Enterprise, Cloudflare
  * counts rate-limit rules per data center, and the Rulesets API rejects the rule
@@ -125,7 +144,7 @@ export interface RateLimitResult {
 const SCOPE_HINT = 'Zone → WAF: Edit (plus a Zone resource covering the domain)';
 
 /**
- * Idempotently apply the download-beacon rate-limit rule to `domain`'s zone.
+ * Idempotently apply the public-endpoint rate-limit rule to `domain`'s zone.
  *
  * Sequence (all via `cfApi`, Bearer `cfToken`):
  *   1. GET /zones?name=<host>            → resolve the zone id (host derived from
@@ -134,7 +153,7 @@ const SCOPE_HINT = 'Zone → WAF: Edit (plus a Zone resource covering the domain
  *   2. GET /zones/<id>/rulesets/phases/http_ratelimit/entrypoint → the zone's
  *      rate-limit ruleset. 404 = no ruleset yet (fine — we create it). 401/403 or
  *      other non-ok = token lacks WAF scope → clear error, no mutation.
- *   3. Reconcile by `ref`/`description`:
+ *   3. Reconcile by `ref` (never the description — see the note at the match):
  *        - found & identical            → no-op, status 'exists'.
  *        - found & differs (param bump) → PATCH that one rule, status 'updated'.
  *        - not found, ruleset exists    → POST add our rule only, status 'created'.
@@ -230,9 +249,9 @@ export async function applyDownloadRateLimit(
 		};
 	}
 	return mine
-		? { status: 'updated', detail: `updated the download-beacon rate-limit rule on ${host}` }
+		? { status: 'updated', detail: `updated the public-endpoint rate-limit rule on ${host}` }
 		: {
 				status: 'created',
-				detail: `created the download-beacon rate-limit rule on ${host} (POST /api/metrics/download: max ${RULE_RATELIMIT.requests_per_period} / ${RULE_RATELIMIT.period}s per IP, ${RULE_RATELIMIT.mitigation_timeout}s block)`
+				detail: `created the public-endpoint rate-limit rule on ${host} (POST /api/metrics/download + GET/HEAD /api/oembed: max ${RULE_RATELIMIT.requests_per_period} / ${RULE_RATELIMIT.period}s per IP, ${RULE_RATELIMIT.mitigation_timeout}s block)`
 			};
 }

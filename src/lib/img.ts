@@ -16,9 +16,57 @@ export function isAnimatedSource(url: string): boolean {
 }
 
 /**
+ * True for UploadThing's image hosts (`ufs.sh` / `utfs.io`, incl. subdomains).
+ * The one place that list lives, so the caller that special-cases UploadThing
+ * (ref-image.ts's crossorigin branch) cannot drift from it.
+ */
+export function isUploadThingHost(host: string): boolean {
+	return (
+		host === 'ufs.sh' ||
+		host === 'utfs.io' ||
+		host.endsWith('.ufs.sh') ||
+		host.endsWith('.utfs.io')
+	);
+}
+
+/** Registrable domain, approximated as the last two labels of a hostname. */
+function registrableDomain(host: string): string {
+	return host.split('.').slice(-2).join('.');
+}
+
+/**
+ * True when an image source hostname is on the same Cloudflare zone as the page
+ * serving it, and may therefore ride a `/cdn-cgi/image/...` transform: the page
+ * host itself, or a host whose registrable domain IS the page host (a fork's own
+ * r2PublicUrl subdomain, `cdn.example.com` on `example.com`).
+ *
+ * An ALLOW-list, not a deny-list of known off-zone hosts: the transform 403s
+ * every off-zone source, and a deny-list can only enumerate the ones we thought
+ * of — an R2 custom domain on a different zone, or any non-CF CDN, would get a
+ * transform URL that 403s. Unrecognised hosts fall to raw, which always works.
+ *
+ * Registrable domain is approximated as the last two labels, which is why the
+ * comparison is against the page host itself rather than the page's own last two:
+ * every fork domain is two labels, and under a multi-part TLD the sloppy version
+ * would read two UNRELATED registrations (`example.co.uk`, `other.co.uk`) as one
+ * zone. Here `cdn.example.co.uk` compares `co.uk` against `example.co.uk`, does
+ * not match, and is served raw — the failing-safe side. Same for a page served on
+ * a subdomain: siblings of `www.example.com` fall to raw rather than guess.
+ */
+export function isSameZoneImageHost(srcHost: string, pageHost: string): boolean {
+	if (!srcHost || !pageHost) return false;
+	if (srcHost === pageHost) return true;
+	return registrableDomain(srcHost) === pageHost;
+}
+
+/**
  * Route an image URL through Cloudflare Image Transformations so grids
  * and thumbnails don't download multi-MB originals. In dev the CF edge
  * isn't available, so fall through to the raw URL.
+ *
+ * Link-preview images do NOT come through here: $lib/social-image has its own
+ * transform (no dev bypass, no animated bypass) because social consumers fetch
+ * from the public edge and a JSON payload has no rawFallback.
  *
  * Lives here rather than in $lib/index.ts (which re-exports it, so callers are
  * unaffected) because the responsive builders below need it and importing back

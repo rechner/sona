@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { APP_NAME } from '$lib/config';
+	import { socialImage } from '$lib/social-image';
 
 	interface Props {
 		title: string;
@@ -25,30 +26,13 @@
 		oembedUrl = null
 	}: Props = $props();
 
-	const OG_MAX_WIDTH = 1200;
-
-	function transformedImage(src: string, pageUrl: string): string {
-		try {
-			const origin = new URL(pageUrl).origin;
-			return `${origin}/cdn-cgi/image/width=${OG_MAX_WIDTH},quality=85,fit=scale-down,format=auto/${src}`;
-		} catch {
-			return src;
-		}
-	}
-
 	// $derived so the tags track prop changes on a same-route nav (e.g. the gallery
-	// detail page swapping images), not just the initial value.
-	const ogImage = $derived(image ? transformedImage(image, url) : null);
-
-	const ogDimensions = $derived.by(() => {
-		if (!(image && imageWidth && imageHeight)) return { width: null, height: null };
-		if (imageWidth > OG_MAX_WIDTH) {
-			return { width: OG_MAX_WIDTH, height: Math.round(imageHeight * (OG_MAX_WIDTH / imageWidth)) };
-		}
-		return { width: imageWidth, height: imageHeight };
-	});
-	const ogWidth = $derived(ogDimensions.width);
-	const ogHeight = $derived(ogDimensions.height);
+	// detail page swapping images), not just the initial value. One helper call, so
+	// the advertised url and its dimensions always describe the same image.
+	const social = $derived(image ? socialImage(image, url, imageWidth, imageHeight) : null);
+	const ogImage = $derived(social?.url ?? null);
+	const ogWidth = $derived(social?.width ?? null);
+	const ogHeight = $derived(social?.height ?? null);
 </script>
 
 <svelte:head>

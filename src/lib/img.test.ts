@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cdnImage, isAnimatedSource, rawFallback } from '$lib';
+import { isUploadThingHost, isSameZoneImageHost } from '$lib/img';
 
 // Guards the GIF regression (sona#97 follow-up): GIFs are served raw everywhere
 // cdnImage is used (grid, cards, collections, admin, detail) because off-zone
@@ -107,5 +108,83 @@ describe('rawFallback', () => {
 		rawFallback(img as any, RAW);
 		img.fire('error');
 		expect(img.attrs.src).toBe(RAW);
+	});
+});
+
+// isUploadThingHost decides ref-image.ts's crossorigin branch, so every clause needs
+// its own case: the bare-host ones (`ufs.sh`, `utfs.io`) are not covered by the suffix
+// clauses, and the suffix clauses must keep the leading dot so a lookalike
+// registration can't impersonate a host.
+describe('isUploadThingHost', () => {
+	it('matches UploadThing hosts and their subdomains only', () => {
+		for (const host of ['ufs.sh', 'utfs.io', 'app12.ufs.sh', 'x.utfs.io']) {
+			expect(isUploadThingHost(host), host).toBe(true);
+		}
+		for (const host of ['evilufs.sh', 'notutfs.io', 'cdn.example.com', 'r2.dev']) {
+			expect(isUploadThingHost(host), host).toBe(false);
+		}
+	});
+});
+
+// isSameZoneImageHost decides whether a source rides the /cdn-cgi/image/ transform or
+// is advertised raw. It is an allow-list, so the cases that matter are the two that
+// must transform (same host, sibling subdomain) and everything else falling to raw —
+// including off-zone hosts nobody enumerated.
+describe('isSameZoneImageHost', () => {
+	// A fork domain: two labels, as every fork's is.
+	const PAGE = 'taro.surf';
+
+	it('allows the page host and its own subdomains (the r2PublicUrl case)', () => {
+		for (const host of ['taro.surf', 'cdn.taro.surf', 'images.taro.surf']) {
+			expect(isSameZoneImageHost(host, PAGE), host).toBe(true);
+		}
+	});
+
+	it('refuses a host on a different zone, including one nobody enumerated', () => {
+		// The case the deny-list missed: an R2 custom domain on a DIFFERENT zone.
+		expect(isSameZoneImageHost('cdn.otherdomain.net', 'sona.example.com')).toBe(false);
+	});
+
+	it('refuses every other host, enumerated or not', () => {
+		// The first four are the hosts the old deny-list knew about; the rest are the
+		// ones it silently handed a 403ing transform URL — a non-CF CDN and a lookalike
+		// of the page domain.
+		for (const host of [
+			'ufs.sh',
+			'app12.ufs.sh',
+			'r2.dev',
+			'pub-abc.r2.dev',
+			'images.some-cdn.io',
+			'taro.surf.evil.net'
+		]) {
+			expect(isSameZoneImageHost(host, PAGE), host).toBe(false);
+		}
+	});
+
+	it('allows a same-host source when the PAGE host has three labels', () => {
+		// The `srcHost === pageHost` clause is redundant for a two-label page host
+		// (registrableDomain('taro.surf') === 'taro.surf'), so every case above passes
+		// without it. It only earns its place here: on a fork served at a subdomain,
+		// registrableDomain('sona.example.com') is 'example.com', which does NOT equal
+		// the page host — so without the identity clause a page's own images would be
+		// advertised raw and lose the transform.
+		expect(isSameZoneImageHost('sona.example.com', 'sona.example.com')).toBe(true);
+		// And the documented fail-safe for that same fork shape: a sibling host is not
+		// assumed to share the zone.
+		expect(isSameZoneImageHost('cdn.sona.example.com', 'sona.example.com')).toBe(false);
+	});
+
+	it('refuses when either host is missing', () => {
+		expect(isSameZoneImageHost('', PAGE)).toBe(false);
+		expect(isSameZoneImageHost('cdn.example.com', '')).toBe(false);
+		// Both empty: unreachable via socialImage (it only calls with a truthy
+		// srcHost), so this pins the guard as deliberate defense in depth.
+		expect(isSameZoneImageHost('', '')).toBe(false);
+	});
+
+	it('falls to raw for a multi-part TLD rather than guessing the zone', () => {
+		// Last-two-labels compares `co.uk` with `example.co.uk`: no match, so the
+		// source is served raw. The failing-safe direction — raw always resolves.
+		expect(isSameZoneImageHost('cdn.example.co.uk', 'example.co.uk')).toBe(false);
 	});
 });
