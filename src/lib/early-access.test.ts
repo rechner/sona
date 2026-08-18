@@ -72,11 +72,15 @@ describe('earlyAccessLabelKey', () => {
 });
 
 describe('shipped registry', () => {
-	it('registers vr-avatars with a well-formed GA date', () => {
-		// The exact date is release-process-owned (merge date + 7, set at merge),
-		// so assert presence + shape, not the value.
-		expect(Object.keys(SHIPPED)).toEqual(['vr-avatars']);
-		expect(SHIPPED['vr-avatars']).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+	it('holds only well-formed GA dates', () => {
+		// Empty since vr-avatars retired (SONA-157). Armed against a fabricated
+		// malformed date so the shape check cannot rot while the registry is
+		// empty; the loop guards whatever the next release registers.
+		const shape = /^\d{4}-\d{2}-\d{2}$/;
+		expect('17-08-2026').not.toMatch(shape);
+		for (const gaDate of Object.values(SHIPPED)) {
+			expect(gaDate).toMatch(shape);
+		}
 	});
 
 	it('has a localized display label in every message file for every flag', () => {
@@ -88,24 +92,19 @@ describe('shipped registry', () => {
 				readFileSync(new URL(`../../messages/${locale}.json`, import.meta.url), 'utf-8')
 			) as Record<string, string>
 		}));
-		for (const flag of Object.keys(SHIPPED)) {
-			const key = earlyAccessLabelKey(flag);
-			for (const { locale, messages } of locales) {
-				expect(
-					messages[key],
-					`messages/${locale}.json is missing "${key}" — the settings page would fall back to the raw flag slug`
-				).toBeTruthy();
-			}
-		}
-	});
-
-	it('labels vr-avatars per spec in both locales', () => {
-		const read = (locale: string) =>
-			JSON.parse(
-				readFileSync(new URL(`../../messages/${locale}.json`, import.meta.url), 'utf-8')
-			) as Record<string, string>;
-		expect(read('en')['early_access_label_vr_avatars']).toBe('VR avatars');
-		expect(read('ja')['early_access_label_vr_avatars']).toBe('VRアバター');
+		// The invariant as a predicate, so it can be proven armed against
+		// fabricated inputs even while SHIPPED is empty (SONA-157).
+		const missingLabels = (flags: string[], files: typeof locales) =>
+			flags.flatMap((flag) =>
+				files
+					.filter(({ messages }) => !messages[earlyAccessLabelKey(flag)])
+					.map(({ locale }) => `messages/${locale}.json is missing "${earlyAccessLabelKey(flag)}"`)
+			);
+		// Armed: a flag without messages is caught in both locales, so the
+		// invariant below cannot pass vacuously by never matching anything.
+		expect(missingLabels(['fabricated-flag'], locales)).toHaveLength(2);
+		// The real invariant, over whatever the next release registers.
+		expect(missingLabels(Object.keys(SHIPPED), locales)).toEqual([]);
 	});
 });
 
