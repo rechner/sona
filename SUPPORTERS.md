@@ -6,7 +6,7 @@ the site — online.
 
 ## Sponsors
 
-No one yet. This list fills in as sponsorships come in.
+- [Rechner Fox](https://github.com/rechner) — since August 2026
 
 ## Named and linked
 
