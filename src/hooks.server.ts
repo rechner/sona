@@ -113,10 +113,19 @@ export const authHandle: Handle = async ({ event, resolve }) => {
 		? viewerTimeZone(event.cookies.get(VIEWER_TZ_COOKIE))
 		: 'UTC';
 
+	// security.txt stays reachable on an unclaimed or mid-setup fork — a
+	// deployment with no owner yet still needs a vulnerability-reporting path,
+	// and the route touches this fork's DB in NO direction (SONA-171): it skips
+	// the session lookup below (the response never varies on admin state), the
+	// setup gate, the theme read, and the observability counters. Canonical
+	// spelling only, per the exemption rule above: an encoded spelling takes
+	// the gates like any other path.
+	const isSecurityTxt = canonical && path === '/.well-known/security.txt';
+
 	const token = event.cookies.get(SESSION_COOKIE);
 
 	// Validate session against D1
-	if (token && event.platform?.env.DB) {
+	if (token && !isSecurityTxt && event.platform?.env.DB) {
 		try {
 			const db = getDb(event.platform.env.DB);
 			const session = await db
@@ -169,7 +178,7 @@ export const authHandle: Handle = async ({ event, resolve }) => {
 	const isSetupRoute = canonical && (path === '/admin/setup' || path.startsWith('/admin/setup/'));
 	const isAsset =
 		canonical && (path.startsWith('/_app/') || path === '/favicon.ico' || path === '/favicon.png');
-	if (event.platform?.env.DB && !isSetupRoute && !isAsset) {
+	if (event.platform?.env.DB && !isSetupRoute && !isAsset && !isSecurityTxt) {
 		const db = getDb(event.platform.env.DB);
 		const state = await getSetupState(db, event.platform.env);
 		switch (state) {
@@ -261,13 +270,15 @@ export const authHandle: Handle = async ({ event, resolve }) => {
 	// Apply the active theme + the visitor's dark/light mode at SSR so the first
 	// paint is correct (no flash). themeId comes from cached settings; mode from a
 	// cookie the client toggle sets. Both fill placeholders in app.html. Skip the
-	// settings read for assets/api (not HTML).
+	// settings read for assets/api (not HTML) and security.txt (text/plain —
+	// transformPageChunk never applies, and skipping keeps the route free of any
+	// read from this fork's DB, as its setup-gate exemption above promises).
 	// Explicit cookie wins; otherwise emit 'auto' and let a tiny head script resolve
 	// it to the visitor's OS preference before first paint (see app.html).
 	const modeCookie = event.cookies.get(THEME_MODE_COOKIE);
 	const mode = modeCookie === 'light' || modeCookie === 'dark' ? modeCookie : 'auto';
 	let themeId = 'default';
-	if (event.platform?.env.DB && !isAsset && !path.startsWith('/api')) {
+	if (event.platform?.env.DB && !isAsset && !isSecurityTxt && !path.startsWith('/api')) {
 		try {
 			themeId = (await getSettings(getDb(event.platform.env.DB))).themeId || 'default';
 		} catch {
@@ -296,7 +307,15 @@ export const authHandle: Handle = async ({ event, resolve }) => {
 	// locals.errorSampled; we skip the generic fallback sample for those so a thrown
 	// error yields one detailed row, not a duplicate — but its rollup still lands
 	// here, so it is never double-counted in the rate.
-	if (event.platform?.env.DB && !isAssetPath(path) && isObservabilityEnabled(event.platform?.env)) {
+	// isSecurityTxt is exempt here too, completing the promise the exemptions
+	// above make: a security.txt request touches this fork's DB in NO direction,
+	// writes included (SONA-171). One skipped counter row is a fair trade.
+	if (
+		event.platform?.env.DB &&
+		!isAssetPath(path) &&
+		!isSecurityTxt &&
+		isObservabilityEnabled(event.platform?.env)
+	) {
 		const db = getDb(event.platform.env.DB);
 		// All rolled-up counters for this request go into ONE db.batch — the request
 		// counter, the 5xx error rollup, and (below) the Tier-A page-view counters —

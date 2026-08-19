@@ -36,12 +36,20 @@ function makeHealthyDb(): D1Database {
 	return makeD1(sqlite);
 }
 
-function makeEvent(pathname: string, db: D1Database) {
+function makeEvent(
+	pathname: string,
+	db: D1Database,
+	env: Record<string, string> = {},
+	sessionToken?: string
+) {
 	return {
-		cookies: { get: () => undefined },
+		cookies: { get: () => sessionToken },
 		url: new URL(`https://taro.surf${pathname}`),
+		// The observability block reads request headers for the device class;
+		// a bare Request keeps the DB-isolation spy's /gallery control honest.
+		request: new Request(`https://taro.surf${pathname}`),
 		locals: {} as App.Locals,
-		platform: { env: { DB: db } } as unknown as App.Platform
+		platform: { env: { DB: db, ...env } } as unknown as App.Platform
 	} as never;
 }
 
@@ -49,10 +57,15 @@ const resolve = async () => new Response('ok', { headers: { 'content-type': 'tex
 
 async function driveGate(
 	pathname: string,
-	db: D1Database
+	db: D1Database,
+	env: Record<string, string> = {},
+	sessionToken?: string
 ): Promise<{ redirect: string | null; status: number; body: string }> {
 	try {
-		const res = (await authHandle({ event: makeEvent(pathname, db), resolve } as never)) as Response;
+		const res = (await authHandle({
+			event: makeEvent(pathname, db, env, sessionToken),
+			resolve
+		} as never)) as Response;
 		return { redirect: null, status: res.status, body: await res.text() };
 	} catch (e) {
 		if (isRedirect(e)) return { redirect: e.location, status: e.status, body: '' };
@@ -122,6 +135,43 @@ describe('setup gate — a failed settings read is not "no admin credential"', (
 		sqlite.exec(`CREATE TABLE site_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 
 		expect((await driveGate('/gallery', makeD1(sqlite))).redirect).toBe('/admin/setup');
+	});
+
+	// SONA-171: an unclaimed fork still serves its vulnerability-reporting path
+	// while everything else redirects to the wizard.
+	it('exempts /.well-known/security.txt from the wizard redirect', async () => {
+		const sqlite = new Database(':memory:');
+		sqlite.exec(`CREATE TABLE site_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+
+		const gated = await driveGate('/.well-known/security.txt', makeD1(sqlite));
+		expect(gated.redirect).toBeNull();
+		expect(gated.status).toBe(200);
+	});
+
+	// The stronger promise the exemption comments make: the route performs NO
+	// read from this fork's DB — not the setup gate's, and not the theme read
+	// further down (its skip is try/caught, so without this spy the exemption
+	// could silently regress with every other test green).
+	it('never touches the database for /.well-known/security.txt', async () => {
+		// Observability ON, so the metrics write path is under the spy too — the
+		// route must touch the DB in NO direction, reads and counters alike.
+		const observability = { OBSERVABILITY_ENABLED: 'true' };
+		const db = makeHealthyDb();
+		const prepare = vi.spyOn(db, 'prepare');
+
+		await driveGate('/.well-known/security.txt', db, observability);
+		expect(prepare).not.toHaveBeenCalled();
+
+		// With a session cookie too: the session lookup runs before the gates,
+		// so without its own exemption a cookie-carrying request would read the
+		// sessions table (the CodeRabbit round's catch on sona#379).
+		await driveGate('/.well-known/security.txt', db, observability, 'some-session-token');
+		expect(prepare).not.toHaveBeenCalled();
+
+		// Guard against a vacuous pass: the same drive on a public route does
+		// hit the DB through this spy.
+		await driveGate('/gallery', db, observability);
+		expect(prepare).toHaveBeenCalled();
 	});
 
 	it('lets a configured site through untouched', async () => {

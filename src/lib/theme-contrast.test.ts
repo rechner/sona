@@ -317,15 +317,22 @@ describe('ember light theme WCAG AA contrast', () => {
 // closest to the floor. Scope: assert only; do not tune colors to pass — a new
 // failure is a finding to report, not to silence.
 // Every theme × mode block in app.css, shared by the resting-state and
-// focus-ring describes below (was copy-pasted three times).
-const THEME_BLOCKS = [
-	{ name: 'ember dark', sel: ':root' },
-	{ name: 'ember light', sel: "[data-theme='light']" },
-	{ name: 'aurora dark', sel: "[data-theme-id='aurora']" },
-	{ name: 'aurora light', sel: "[data-theme-id='aurora'][data-theme='light']" },
-	{ name: 'terracotta dark', sel: "[data-theme-id='terracotta']" },
-	{ name: 'terracotta light', sel: "[data-theme-id='terracotta'][data-theme='light']" }
-];
+// focus-ring describes below (was copy-pasted three times). Derived from
+// THEMES rather than hardcoded so a new theme is enumerated automatically —
+// a hardcoded list would let it skip the per-block --link declaration guard
+// and inherit another theme's link color through the shared
+// [data-theme='light'] selector.
+const THEME_BLOCKS = THEMES.flatMap(({ id }) =>
+	id === 'default'
+		? [
+				{ name: 'ember dark', sel: ':root' },
+				{ name: 'ember light', sel: "[data-theme='light']" }
+			]
+		: [
+				{ name: `${id} dark`, sel: `[data-theme-id='${id}']` },
+				{ name: `${id} light`, sel: `[data-theme-id='${id}'][data-theme='light']` }
+			]
+);
 
 describe('resting .btn WCAG AA contrast — every theme × variant × mode (#121)', () => {
 	const variants = [
@@ -621,4 +628,97 @@ describe('status-attention small-text WCAG AA contrast, every theme × surface �
 			});
 		}
 	}
+});
+
+// Prose links (the global `a` rule) color with --link, which tracks each
+// theme's --primary like --status-attention but is overridden where the
+// primary fails AA as small text: Ember light (--primary was 2.20:1 on the
+// page background) and aurora dark (4.38:1) — SONA-171 r1-09/r1-18. The
+// resolution below mirrors the CSS: a block either declares a hex or falls
+// through (var(--primary)) to its own --primary. Every theme block must
+// declare --link itself: the default light block's darkened orange otherwise
+// bleeds into the other light themes through the plain [data-theme='light']
+// selector they all carry.
+describe('prose-link WCAG AA contrast, every theme × surface × mode (SONA-171)', () => {
+	function linkColor(sel: string): string {
+		const body = blockBody(sel);
+		const hex = body.match(/--link:\s*(#[0-9A-Fa-f]{6})\s*;/)?.[1];
+		return hex ?? blockToken(sel, 'primary');
+	}
+
+	it('the global anchor rule colors with var(--link), not var(--primary)', () => {
+		const rule = css.match(/^a\s*\{([^}]*)\}/m)?.[1];
+		if (!rule) throw new Error('global a rule not found in app.css');
+		expect(rule).toMatch(/color:\s*var\(--link\)\s*;/);
+	});
+
+	it('links get a visible keyboard-focus ring using var(--ring)', () => {
+		const rule = css.match(/^a:focus-visible\s*\{([^}]*)\}/m)?.[1];
+		if (!rule) throw new Error('a:focus-visible rule not found in app.css');
+		expect(rule).toMatch(/outline:[^;]*var\(--ring\)/);
+	});
+
+	for (const { name, sel } of THEME_BLOCKS) {
+		it(`${name}: declares --link in its own block`, () => {
+			expect(blockBody(sel)).toMatch(/--link:\s*(#[0-9A-Fa-f]{6}|var\(--primary\))\s*;/);
+		});
+	}
+
+	for (const surface of ['background', 'card'] as const) {
+		for (const { name, sel } of THEME_BLOCKS) {
+			it(`${name}: link text meets 4.5:1 on the ${surface} surface`, () => {
+				expect(contrast(linkColor(sel), blockToken(sel, surface))).toBeGreaterThanOrEqual(4.5);
+			});
+		}
+	}
+});
+
+// SONA-193: component-scoped anchor rules must color with var(--link), never
+// raw var(--primary) — the token exists because --primary fails AA as link
+// text in Ember light (2.20:1) and aurora dark (4.38:1), and a local rule
+// bypasses the global fix in exactly the way the 13 rules this sweep repointed
+// used to. Scans every component/route style block so a new offender fails
+// here instead of shipping.
+describe('no component anchor rule colors with --primary (SONA-193)', () => {
+	const srcRoot = fileURLToPath(new URL('..', import.meta.url));
+	const svelteFiles = readdirSync(srcRoot, { recursive: true })
+		.map(String)
+		.filter((p) => p.endsWith('.svelte'))
+		.map((p) => `${srcRoot}/${p}`);
+	// A selector targets an anchor when `a` appears as its own compound start
+	// (" a", ".x a", "a.y", "a:hover", ":global(a)"), not as a substring of
+	// another word.
+	const anchorSelector = /(^|[\s.,>+~)(])a(\b|:|\.|\[)/;
+	// Text color only, boundary-anchored: border-color/background-color on an
+	// anchor are legitimate --primary uses (brand accents), not link text.
+	const primaryTextColor = /(^|[;{\s])color:\s*var\(--primary\)/;
+
+	it('scans a realistic file set', () => {
+		expect(svelteFiles.length).toBeGreaterThan(50);
+	});
+
+	it('every anchor text color goes through var(--link)', () => {
+		const offenders: string[] = [];
+		for (const file of svelteFiles) {
+			const source = readFileSync(file, 'utf8');
+			for (const rule of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+				if (!primaryTextColor.test(rule[2])) continue;
+				// Every comma-separated selector in the list, not just the last
+				// line: `.foo a,\n.bar` must flag on the `.foo a` part. Each
+				// part's own last line drops any preceding-rule tail the loose
+				// head match swept in.
+				const parts = rule[1]
+					.trim()
+					.split(',')
+					.map((part) => part.split('\n').pop()?.trim() ?? '')
+					.filter(Boolean);
+				for (const selector of new Set(parts)) {
+					if (anchorSelector.test(selector)) {
+						offenders.push(`${file.slice(srcRoot.length)} → ${selector}`);
+					}
+				}
+			}
+		}
+		expect(offenders).toEqual([]);
+	});
 });

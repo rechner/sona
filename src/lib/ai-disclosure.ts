@@ -16,9 +16,38 @@ export interface AiDisclosureTopic {
 	body: string;
 }
 
+export interface AiDisclosureLink {
+	text: string;
+	href: string;
+	/**
+	 * Screen-reader label where the visible text ("through GitHub") doesn't
+	 * name the action on its own. Omitted when the text is self-describing.
+	 */
+	ariaLabel?: string;
+}
+
+export interface AiDisclosureSecurity {
+	/** Short bold lead-in, like AiDisclosureTopic. */
+	lead: string;
+	/** Body segments in order; strings render as text, links as anchors. */
+	body: (string | AiDisclosureLink)[];
+}
+
 export interface AiDisclosure {
 	intro: string;
 	topics: AiDisclosureTopic[];
+	/**
+	 * The vulnerability-reporting line (SONA-171). Separate from `topics`
+	 * because its contacts must be clickable, and a plain-text body can't
+	 * carry an anchor. Points at the UPSTREAM channels — a fork operator
+	 * can't fix a platform bug, so their /ai page must not collect the
+	 * reports. The GitHub URL deliberately differs from the one in
+	 * /.well-known/security.txt: this page links the Security tab (a human
+	 * picks their path from there), while security.txt carries the
+	 * /security/advisories/new report form for tooling. Same channels,
+	 * different entry points.
+	 */
+	security: AiDisclosureSecurity;
 	/** Muted closing line. */
 	closer: string;
 }
@@ -48,6 +77,20 @@ export function defaultAiDisclosure(): AiDisclosure {
 				body: "Claude is trained on scraped text and code. That data isn't Sona's, and nobody here can vouch for how it was gathered."
 			}
 		],
+		security: {
+			lead: 'Security problems.',
+			body: [
+				'If you find a vulnerability, report it privately, either ',
+				{
+					text: 'through GitHub',
+					href: 'https://github.com/sona-fast/sona/security',
+					ariaLabel: 'Report a vulnerability through GitHub'
+				},
+				' or by email to ',
+				{ text: 'security@sona.fast', href: 'mailto:security@sona.fast' },
+				'. Every Sona site runs this same code, so posting details publicly exposes all of them before a fix exists.'
+			]
+		},
 		closer:
 			'If any of this changes, this page changes with it. When the footer shows a build number, it links to the source this exact build came from.'
 	};
