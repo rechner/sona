@@ -42,8 +42,10 @@ import {
 	ciWiringEntries,
 	cfApi,
 	securitySummaryLines,
-	pagesPatchConfirmsSitekey
+	pagesPatchConfirmsSitekey,
+	cdnAttachmentLines
 } from './setup-lib.ts';
+import { resolveZone } from './connect-domains-lib.ts';
 import { applyDownloadRateLimit, type RateLimitStatus } from './waf-lib.ts';
 import { provisionTurnstileWidget, type TurnstileStatus } from './turnstile-lib.ts';
 // Shared with the admin Settings save so the seeded siteUrl passes the same
@@ -327,19 +329,41 @@ async function main() {
 	// Whether the Pages-project PATCH (which carries TURNSTILE_SITEKEY) landed —
 	// the summary reports the bot check as wired only when it did.
 	let pagesConfigOk = false;
+	// The RESOLVED zone's name — the parent zone for a subdomain host. Summary
+	// lines that name the zone must use this, not the host (which for a
+	// subdomain has no Cloudflare zone of its own).
+	let resolvedZoneName: string | null = null;
 	if (domain) {
 		const host = hostFromDomain(domain);
 		if (cfToken && cfAccount) {
 			// A subdomain (sona.example.com) is served by the registrable zone
-			// (example.com); an exact-name lookup finds nothing, so try the host then
-			// strip leading labels until a zone on the account matches.
-			let zoneId: string | undefined;
-			for (const candidate of zoneNameCandidates(host)) {
-				const zoneRes = await cfApi(cfToken, `/zones?name=${encodeURIComponent(candidate)}`);
-				zoneId = ((zoneRes.result as { id: string }[] | undefined) ?? [])[0]?.id;
-				if (zoneId) break;
-			}
-			if (!zoneId) {
+			// (example.com); the shared candidate walk tries the host then strips
+			// leading labels, and aborts on a failed lookup so a 403 or transient
+			// error is reported as what it is — not as "no zone".
+			const {
+				zone: preflightZone,
+				zoneName: preflightZoneName,
+				errorStatus: zoneLookupError,
+				failedName: zoneLookupFailedName
+			} = await resolveZone(zoneNameCandidates(host), (name) =>
+				cfApi(cfToken, `/zones?name=${encodeURIComponent(name)}`)
+			);
+			resolvedZoneName = preflightZoneName;
+			const zoneId = preflightZone.id;
+			if (zoneLookupError !== null) {
+				// status 0 = fetch threw (no network); a 2xx here means the API said
+				// success:false — neither reads sensibly as a bare "HTTP <n>".
+				const why =
+					zoneLookupError === 0
+						? 'could not reach the Cloudflare API'
+						: `Cloudflare API error, HTTP ${zoneLookupError}`;
+				console.warn(
+					`\n⚠ Zone lookup failed for ${zoneLookupFailedName ?? host} (${why}) — skipping the DNS / image-transform preflight.`
+				);
+				console.warn(
+					'  A 401/403 means the token lacks Zone · Zone · Read; otherwise re-run setup to retry.'
+				);
+			} else if (!zoneId) {
 				console.warn(
 					`\n⚠ No Cloudflare zone found for ${host} — skipping the DNS / image-transform preflight.`
 				);
@@ -385,7 +409,8 @@ async function main() {
 				// beacon + oEmbed provider — one rule, Free-plan cap). Non-fatal:
 				// a token without Zone · WAF · Edit just yields an 'error'
 				// result we warn about in Next steps — setup keeps going regardless.
-				const rateLimit = await applyDownloadRateLimit(cfToken, host);
+				// Reuse the zone the preflight just resolved — no second candidate walk.
+				const rateLimit = await applyDownloadRateLimit(cfToken, host, cfApi, zoneId);
 				downloadRateLimit = rateLimit.status;
 				downloadRateLimitDetail = rateLimit.detail;
 				if (rateLimit.status === 'error') {
@@ -648,11 +673,9 @@ async function main() {
 	console.log('  1. Deploy:  git push  (or `npx wrangler pages deploy .svelte-kit/cloudflare`)');
 	console.log(`  2. Open  https://${project}.pages.dev/admin/setup  and finish in the wizard.`);
 	if (useR2 && r2PublicUrl) {
-		console.log(`  3. Point ${r2PublicUrl} at the bucket YOURSELF (setup did not touch DNS):`);
-		console.log(
-			`     Cloudflare dashboard → R2 → ${bucket} → Settings → Custom Domains → add ${r2PublicUrl},`
-		);
-		console.log('     then create the DNS record it prompts for. Images 404 until this is done.');
+		for (const line of cdnAttachmentLines(r2PublicUrl, bucket, domain)) {
+			console.log(line);
+		}
 	}
 	if (domain) {
 		const host = hostFromDomain(domain);
@@ -662,15 +685,18 @@ async function main() {
 		// Image Transformations (thumbnails/OG). off by default, per-zone; can't be
 		// enabled by the deploy token. imageResizingOn: true (on), false (still off),
 		// null (couldn't check — token lacks Zone Settings:Read).
+		// Zone-wide setting: name the RESOLVED zone (the parent for a subdomain),
+		// which is where the dashboard path actually lives.
+		const zoneName = resolvedZoneName ?? host;
 		if (imageResizingOn === true) {
-			console.log(`  • Image Transformations: enabled on the ${host} zone (thumbnails will resize).`);
+			console.log(`  • Image Transformations: enabled on the ${zoneName} zone (thumbnails will resize).`);
 			// Enabling the zone setting does NOT enable "Resize images from any origin",
 			// which a cross-zone source (e.g. an R2 public URL on another zone) needs.
 			console.log('     If images load from another zone/origin (e.g. an R2 public URL), also turn on');
-			console.log(`     "Resize images from any origin":  dashboard → ${host} → Images → Transformations.`);
+			console.log(`     "Resize images from any origin":  dashboard → ${zoneName} → Images → Transformations.`);
 		} else {
 			console.log('  • Image Transformations (thumbnails/OG images) is OFF or unverified. Enable it:');
-			console.log(`     dashboard → ${host} → Images → Transformations → "Enable for zone" +`);
+			console.log(`     dashboard → ${zoneName} → Images → Transformations → "Enable for zone" +`);
 			console.log('     "Resize images from any origin". Free tier: 5,000 transformations/month.');
 			console.log('     Until on, gallery thumbnails serve the full-size original (slow) or 404.');
 		}
@@ -680,7 +706,8 @@ async function main() {
 			downloadRateLimit,
 			downloadRateLimitDetail,
 			turnstileStatus,
-			pagesConfigOk && turnstileSecretSet
+			pagesConfigOk && turnstileSecretSet,
+			resolvedZoneName
 		)) {
 			console.log(line);
 		}
