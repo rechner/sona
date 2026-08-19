@@ -5,6 +5,9 @@
  * tested without a Cloudflare account or a live shell.
  */
 
+import type { RateLimitStatus } from './waf-lib.ts';
+import type { TurnstileStatus } from './turnstile-lib.ts';
+
 const sqlStr = (s: string) => s.replace(/'/g, "''");
 
 export interface Migration {
@@ -389,4 +392,77 @@ export function ciWiringEntries(input: CiWiringInput): CiEntry[] {
 		{ kind: 'variable', name: 'SITE_URL', value: input.siteUrl },
 		{ kind: 'variable', name: 'FURTRACK_MODE', value: input.furtrackMode }
 	];
+}
+
+/**
+ * End-of-run summary lines for the zone-security provisioning (public-endpoint
+ * rate limit + admin-login Turnstile). The two features are independent, so the
+ * Turnstile lines must print for every rate-limit outcome — kept pure so a test
+ * can pin that, and the wording, without running the CLI.
+ *
+ * Status contracts: null = not attempted (no domain / no zone / no token);
+ * 'error' = provisioning failed — `downloadRateLimitDetail` carries waf-lib's
+ * reason (missing scope, absent zone, HTTP failure), which the summary repeats
+ * instead of assuming a cause; 'exists' rate limits are old news and stay
+ * silent.
+ *
+ * `turnstileWired` says whether BOTH halves of the wiring actually landed (the
+ * Pages PATCH carrying TURNSTILE_SITEKEY and the TURNSTILE_SECRET put). The
+ * login check fails open when either is missing, so a provisioned widget with
+ * failed wiring must read as NOT protected — never as enforced.
+ */
+export function securitySummaryLines(
+	host: string,
+	downloadRateLimit: RateLimitStatus | null,
+	downloadRateLimitDetail: string | null,
+	turnstileStatus: TurnstileStatus | null,
+	turnstileWired: boolean
+): string[] {
+	const lines: string[] = [];
+	if (downloadRateLimit === 'error') {
+		lines.push(
+			`  • Public-endpoint rate limit: NOT set (${downloadRateLimitDetail ?? 'provisioning failed'}).`
+		);
+		lines.push('     Fix that, then run:');
+		lines.push(`       CLOUDFLARE_API_TOKEN=<token> npm run apply-download-ratelimit -- ${host}`);
+	} else if (downloadRateLimit && downloadRateLimit !== 'exists') {
+		lines.push(
+			`  • Public-endpoint rate limit: applied to the ${host} zone (download beacon + oEmbed).`
+		);
+	}
+	if (turnstileStatus === 'error') {
+		lines.push('  • Admin-login bot check: NOT set (token lacks Account · Turnstile · Edit).');
+		lines.push('     Add that permission to the token and re-run setup to protect /admin/login.');
+	} else if (turnstileStatus && !turnstileWired) {
+		// Worded as an unverified-THIS-RUN claim: on a re-run, a previous run may
+		// have wired the project already, so "no bot check" would be false there —
+		// but on a first run it's exactly true, and that's the case that matters.
+		lines.push(
+			`  • Admin-login bot check: Turnstile widget ${turnstileStatus} for ${host}, but this run could`
+		);
+		lines.push('     NOT confirm the TURNSTILE_SITEKEY var + TURNSTILE_SECRET secret attached. On a');
+		lines.push('     first run that means /admin/login has NO bot check (it fails open without both) —');
+		lines.push('     re-run setup, or set the var + secret on the Pages project yourself.');
+	} else if (turnstileStatus) {
+		lines.push(`  • Admin-login bot check: Turnstile ${turnstileStatus} for ${host}`);
+		lines.push('     (TURNSTILE_SITEKEY var + TURNSTILE_SECRET secret set; enforced once deployed).');
+	}
+	return lines;
+}
+
+/**
+ * True when a Pages-project PATCH response confirms TURNSTILE_SITEKEY persisted
+ * with the value we sent. The PATCH returns the updated project; a 200 whose
+ * body silently dropped the var must not be reported as wired (the login check
+ * fails open without the sitekey), so the summary's turnstileWired flag keys
+ * off this read-back, not the HTTP status alone. Missing/malformed bodies read
+ * as unconfirmed — the safe, under-claiming direction.
+ */
+export function pagesPatchConfirmsSitekey(result: unknown, sitekey: string): boolean {
+	const envVars = (
+		result as {
+			deployment_configs?: { production?: { env_vars?: Record<string, { value?: string } | null> } };
+		} | null
+	)?.deployment_configs?.production?.env_vars;
+	return envVars?.TURNSTILE_SITEKEY?.value === sitekey;
 }

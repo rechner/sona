@@ -40,7 +40,9 @@ import {
 	imageResizingOutcome,
 	imageResizingIsOn,
 	ciWiringEntries,
-	cfApi
+	cfApi,
+	securitySummaryLines,
+	pagesPatchConfirmsSitekey
 } from './setup-lib.ts';
 import { applyDownloadRateLimit, type RateLimitStatus } from './waf-lib.ts';
 import { provisionTurnstileWidget, type TurnstileStatus } from './turnstile-lib.ts';
@@ -310,6 +312,10 @@ async function main() {
 	// runs on a zone the operator controls — a *.pages.dev-only fork has no zone to
 	// attach it to. Null = not attempted (no domain / no zone / no token).
 	let downloadRateLimit: RateLimitStatus | null = null;
+	// The human-readable reason behind a rate-limit 'error' — waf-lib names the
+	// actual failure (scope, missing zone, HTTP error), and the summary should
+	// repeat that instead of guessing at a cause.
+	let downloadRateLimitDetail: string | null = null;
 	// Admin-login Turnstile widget. Only meaningful with a custom
 	// domain — a *.pages.dev-only fork isn't provisioned one. Its sitekey (public)
 	// is set as a Pages var below and its secret as a Pages secret; the login page
@@ -318,6 +324,9 @@ async function main() {
 	let turnstileStatus: TurnstileStatus | null = null;
 	let turnstileSitekey = '';
 	let turnstileSecret = '';
+	// Whether the Pages-project PATCH (which carries TURNSTILE_SITEKEY) landed —
+	// the summary reports the bot check as wired only when it did.
+	let pagesConfigOk = false;
 	if (domain) {
 		const host = hostFromDomain(domain);
 		if (cfToken && cfAccount) {
@@ -376,12 +385,13 @@ async function main() {
 				// beacon + oEmbed provider — one rule, Free-plan cap). Non-fatal:
 				// a token without Zone · WAF · Edit just yields an 'error'
 				// result we warn about in Next steps — setup keeps going regardless.
-				const rl = await applyDownloadRateLimit(cfToken, host);
-				downloadRateLimit = rl.status;
-				if (rl.status === 'error') {
-					console.warn(`\n⚠ Could not attach the public-endpoint rate-limit rule: ${rl.detail}`);
+				const rateLimit = await applyDownloadRateLimit(cfToken, host);
+				downloadRateLimit = rateLimit.status;
+				downloadRateLimitDetail = rateLimit.detail;
+				if (rateLimit.status === 'error') {
+					console.warn(`\n⚠ Could not attach the public-endpoint rate-limit rule: ${rateLimit.detail}`);
 				} else {
-					console.log(`✔ Public-endpoint rate limit: ${rl.detail}`);
+					console.log(`✔ Public-endpoint rate limit: ${rateLimit.detail}`);
 				}
 			}
 
@@ -464,6 +474,10 @@ async function main() {
 			method: 'PATCH',
 			body: payload
 		});
+		// A 200 whose body dropped the sitekey must not read as wired — confirm the
+		// PATCH persisted TURNSTILE_SITEKEY (skipped when no widget was provisioned).
+		pagesConfigOk =
+			res.ok && (!turnstileSitekey || pagesPatchConfirmsSitekey(res.result, turnstileSitekey));
 		if (res.ok) {
 			console.log(
 				'✔ attached D1/R2 bindings + FURTRACK_MODE to the Pages project (CI deploys get working bindings).'
@@ -531,15 +545,18 @@ async function main() {
 	// 7. Generate + set secrets. SETUP_TOKEN gates the first-run wizard.
 	const setupToken = token();
 	const cronSecret = token();
-	const putSecret = (name: string, value: string) => {
+	const putSecret = (name: string, value: string): boolean => {
 		// Feed the value over stdin (never the command line or the log) so the
 		// secret is not echoed to the console or exposed in the process list.
+		// Returns whether the put succeeded — the summary must not claim a
+		// security control is wired when the write silently failed.
 		const cmd = `npx wrangler pages secret put ${name} --project-name ${project}`;
 		console.log(`\n$ ${cmd}`);
 		try {
 			execSync(cmd, { input: `${value}\n`, stdio: ['pipe', 'inherit', 'inherit'] });
+			return true;
 		} catch {
-			// allowFail
+			return false; // allowFail
 		}
 	};
 	putSecret('SETUP_TOKEN', setupToken);
@@ -550,7 +567,9 @@ async function main() {
 	if (resendFrom) putSecret('RESEND_FROM', resendFrom);
 	// Turnstile secret for the admin-login siteverify. Server-only, so
 	// it's a Pages secret (never a plain var); the public sitekey was set above.
-	if (turnstileSecret) putSecret('TURNSTILE_SECRET', turnstileSecret);
+	// The login check fails open without it, so remember whether the put landed.
+	let turnstileSecretSet = false;
+	if (turnstileSecret) turnstileSecretSet = putSecret('TURNSTILE_SECRET', turnstileSecret);
 
 	// 8. Offer to wire the fork's GitHub Actions secrets/vars so CI deploys work
 	//    with no separate manual step. Only when gh is installed + authenticated,
@@ -655,23 +674,15 @@ async function main() {
 			console.log('     "Resize images from any origin". Free tier: 5,000 transformations/month.');
 			console.log('     Until on, gallery thumbnails serve the full-size original (slow) or 404.');
 		}
-		// Public-endpoint rate limit. null = not attempted (no domain / no zone / no
-		// token — same contract as the declaration above); 'error' = the token lacked
-		// Zone · WAF · Edit, which is the one case worth telling them how to fix.
-		if (downloadRateLimit === 'error') {
-			console.log('  • Public-endpoint rate limit: NOT set (token lacks Zone · WAF · Edit).');
-			console.log('     Add that permission to the token, then run:');
-			console.log(`       CLOUDFLARE_API_TOKEN=<token> npm run apply-download-ratelimit -- ${host}`);
-		} else if (downloadRateLimit && downloadRateLimit !== 'exists') {
-			console.log(`  • Public-endpoint rate limit: applied to the ${host} zone (download beacon + oEmbed).`);
-		// Admin-login Turnstile. 'error' = token lacked the scope, so the
-		// login has no bot check; otherwise the sitekey/secret are wired and enforced.
-		if (turnstileStatus === 'error') {
-			console.log('  • Admin-login bot check: NOT set (token lacks Account · Turnstile · Edit).');
-			console.log('     Add that permission to the token and re-run setup to protect /admin/login.');
-		} else if (turnstileStatus) {
-			console.log(`  • Admin-login bot check: Turnstile ${turnstileStatus} for ${host}`);
-			console.log('     (TURNSTILE_SITEKEY var + TURNSTILE_SECRET secret set; enforced once deployed).');
+		// Zone security: rate limit + admin-login Turnstile.
+		for (const line of securitySummaryLines(
+			host,
+			downloadRateLimit,
+			downloadRateLimitDetail,
+			turnstileStatus,
+			pagesConfigOk && turnstileSecretSet
+		)) {
+			console.log(line);
 		}
 	}
 	console.log('\n  Your one-time setup token (enter it in the wizard):\n');

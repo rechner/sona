@@ -20,7 +20,9 @@ import {
 	imageResizingOutcome,
 	imageResizingIsOn,
 	ciWiringEntries,
-	cfApi
+	cfApi,
+	securitySummaryLines,
+	pagesPatchConfirmsSitekey
 } from './setup-lib.ts';
 
 describe('buildMigrationSql', () => {
@@ -604,5 +606,115 @@ describe('ciWiringEntries ↔ workflow YAML contract', () => {
 	it.each(entries)('$name is referenced as a workflow $kind', ({ kind, name }) => {
 		const ref = kind === 'secret' ? `secrets.${name}` : `vars.${name}`;
 		expect(yaml).toContain(ref);
+	});
+});
+
+describe('securitySummaryLines', () => {
+	const turnstileWarning = '  • Admin-login bot check: NOT set (token lacks Account · Turnstile · Edit).';
+
+	it('prints the Turnstile warning for EVERY rate-limit outcome (regression: a missing brace once nested it inside the applied branch)', () => {
+		for (const rl of [null, 'exists', 'error', 'created', 'updated'] as const) {
+			const lines = securitySummaryLines('taro.surf', rl, null, 'error', true);
+			expect(lines, `downloadRateLimit=${rl}`).toContain(turnstileWarning);
+		}
+	});
+
+	it('reports an applied rate limit and a created Turnstile widget together', () => {
+		const lines = securitySummaryLines('taro.surf', 'created', null, 'created', true);
+		expect(lines.join('\n')).toContain('Public-endpoint rate limit: applied to the taro.surf zone');
+		expect(lines.join('\n')).toContain('Admin-login bot check: Turnstile created for taro.surf');
+	});
+
+	it('repeats waf-lib’s failure reason and the retry command for a rate-limit error', () => {
+		const detail = 'token has no access to zone taro.surf: add Zone · WAF · Edit';
+		const text = securitySummaryLines('taro.surf', 'error', detail, null, false).join('\n');
+		expect(text).toContain(detail);
+		expect(text).toContain('npm run apply-download-ratelimit -- taro.surf');
+	});
+
+	it('does not blame token scope for a non-permission rate-limit failure', () => {
+		const detail = 'failed to write the rate-limit rule to taro.surf (HTTP 500)';
+		const text = securitySummaryLines('taro.surf', 'error', detail, null, false).join('\n');
+		expect(text).toContain(detail);
+		expect(text).not.toContain('token lacks Zone · WAF · Edit');
+		expect(text).toContain('npm run apply-download-ratelimit -- taro.surf');
+	});
+
+	it('falls back to a generic failure line when no detail survived', () => {
+		const text = securitySummaryLines('taro.surf', 'error', null, null, false).join('\n');
+		expect(text).toContain('NOT set (provisioning failed)');
+		expect(text).not.toContain('token lacks');
+	});
+
+	it('reports NO bot check when the widget provisioned but the wiring failed', () => {
+		// The login check fails open without the sitekey var + secret, so a
+		// provisioned widget with failed wiring must never read as enforced.
+		for (const status of ['created', 'exists'] as const) {
+			const text = securitySummaryLines('taro.surf', 'exists', null, status, false).join('\n');
+			expect(text).toContain('NOT confirm the TURNSTILE_SITEKEY');
+			expect(text).toContain('/admin/login has NO bot check');
+			// Honest on re-runs: the claim is scoped to this run / first runs.
+			expect(text).toContain('this run');
+			expect(text).toContain('first run');
+			expect(text).not.toContain('enforced once deployed');
+		}
+	});
+
+	it('never prints the enforced claim unless the wiring landed', () => {
+		const wired = securitySummaryLines('taro.surf', null, null, 'created', true).join('\n');
+		expect(wired).toContain('enforced once deployed');
+		const unwired = securitySummaryLines('taro.surf', null, null, 'created', false).join('\n');
+		expect(unwired).not.toContain('enforced once deployed');
+	});
+
+	it('stays silent about pre-existing rate limits and unattempted Turnstile', () => {
+		expect(securitySummaryLines('taro.surf', 'exists', null, null, false)).toEqual([]);
+		expect(securitySummaryLines('taro.surf', null, null, null, false)).toEqual([]);
+	});
+});
+
+describe('setup.ts ↔ securitySummaryLines call-site contract', () => {
+	// main() is not importable (it drives live Cloudflare state), so pin the
+	// wiring at the source level: turnstileWired must be composed from the real
+	// PATCH result and the real secret-put result — forcing a literal here once
+	// survived the entire suite while reintroducing the very over-claim the
+	// helper exists to prevent.
+	const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'setup.ts'), 'utf8');
+
+	it('passes pagesConfigOk && turnstileSecretSet, not a literal', () => {
+		expect(src).toMatch(/securitySummaryLines\(/);
+		expect(src).toMatch(/pagesConfigOk && turnstileSecretSet/);
+	});
+
+	it('assigns pagesConfigOk from the Pages PATCH result, read-back confirmed', () => {
+		expect(src).toMatch(/pagesConfigOk =\s*\n?\s*res\.ok/);
+		expect(src).toMatch(/pagesPatchConfirmsSitekey\(res\.result, turnstileSitekey\)/);
+	});
+
+	it('putSecret reports failure instead of swallowing it', () => {
+		expect(src).toMatch(/catch\s*\{\s*\n?\s*return false/);
+	});
+});
+
+describe('pagesPatchConfirmsSitekey', () => {
+	const body = (value?: string) => ({
+		deployment_configs: {
+			production: { env_vars: value === undefined ? {} : { TURNSTILE_SITEKEY: { value } } }
+		}
+	});
+
+	it('confirms when the response echoes the sitekey we sent', () => {
+		expect(pagesPatchConfirmsSitekey(body('0xKEY'), '0xKEY')).toBe(true);
+	});
+
+	it('rejects a response that dropped or changed the var', () => {
+		expect(pagesPatchConfirmsSitekey(body(), '0xKEY')).toBe(false);
+		expect(pagesPatchConfirmsSitekey(body('0xOTHER'), '0xKEY')).toBe(false);
+	});
+
+	it('reads a missing/malformed body as unconfirmed (the safe direction)', () => {
+		expect(pagesPatchConfirmsSitekey(undefined, '0xKEY')).toBe(false);
+		expect(pagesPatchConfirmsSitekey({}, '0xKEY')).toBe(false);
+		expect(pagesPatchConfirmsSitekey({ deployment_configs: null }, '0xKEY')).toBe(false);
 	});
 });
