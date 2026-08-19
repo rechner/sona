@@ -12,6 +12,7 @@ import {
 	parseSonaColors
 } from '$lib/server/settings';
 import { deleteOrphansAll, collectReferencedUrls } from '$lib/server/storage';
+import { collectUsageBreakdown, type StorageBreakdown } from '$lib/server/storage/usage-breakdown';
 import { clearVrTabCache } from '$lib/server/vr-gate';
 import { clearStickerTabCache } from '$lib/server/stickers';
 import { clearCollectionsNavCache } from '$lib/server/collections';
@@ -70,6 +71,17 @@ import type { Actions, PageServerLoad } from './$types';
 
 const SESSION_DURATION = 60 * 60 * 24 * 7; // 7 days in seconds
 
+// Cap a slow upstream (UT usage API, R2 listing) so the settings page never
+// hangs on it; the timer is cleared on both outcomes so a rejection can't
+// leave it running.
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+	});
+	return Promise.race([promise, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
 export const load: PageServerLoad = async ({ platform, url, locals }) => {
 	const db = getDb(platform!.env.DB);
 	// The editor must render current persisted values, not a cached snapshot.
@@ -98,9 +110,7 @@ export const load: PageServerLoad = async ({ platform, url, locals }) => {
 	if (token) {
 		try {
 			const utapi = new UTApi({ token });
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 5000);
-			const info = await Promise.race([
+			const info = await withDeadline(
 				(utapi as unknown as {
 					getUsageInfo(): Promise<{
 						appTotalBytes: number;
@@ -109,11 +119,8 @@ export const load: PageServerLoad = async ({ platform, url, locals }) => {
 						filesUploaded: number;
 					}>;
 				}).getUsageInfo(),
-				new Promise<never>((_, reject) => {
-					controller.signal.addEventListener('abort', () => reject(new Error('UT timeout')));
-				})
-			]);
-			clearTimeout(timeout);
+				5000
+			);
 			utUsage = {
 				usedBytes: info.appTotalBytes,
 				limitBytes: info.limitBytes,
@@ -162,6 +169,34 @@ export const load: PageServerLoad = async ({ platform, url, locals }) => {
 	// for display. Empty until the first pilot feature is registered.
 	const earlyAccess = earlyAccessActive(now).map((e) => ({ flag: e.flag, gaDate: formatDate(e.gaDate) }));
 
+	// Per-content-type usage (SONA-192) — R2 only: derived from listing the
+	// bucket, so it also counts files D1 never tracked. Reduced to counts and
+	// sums here; raw object keys never leave the server or reach a log line.
+	// A list failure, a bucket too big for the page cap, or a listing slower
+	// than 5s all degrade to breakdown=null and the tab falls back to the
+	// aggregate bar (same deadline pattern as the UT usage fetch above).
+	// breakdownTooLarge tells the page WHY there's no breakdown — the page-cap
+	// case gets its own note instead of reading as a transient read failure.
+	//
+	// This block must stay LAST in load: each list() page is a subrequest, and
+	// the Workers free plan caps an invocation at 50 subrequests shared with
+	// every D1 query above. Listing last means a bucket big enough to exhaust
+	// the budget only costs the breakdown (null → aggregate bar), never the
+	// D1-backed fields the rest of the page needs.
+	let breakdown: StorageBreakdown | null = null;
+	let breakdownTooLarge = false;
+	if (settings.storageProvider === 'r2' && platform?.env.IMAGES) {
+		try {
+			const collected = await withDeadline(collectUsageBreakdown(platform.env.IMAGES), 5000);
+			if (collected === 'too-large') breakdownTooLarge = true;
+			else breakdown = collected;
+		} catch {
+			// R2 list unavailable or too slow — the aggregate bar still renders.
+			// If logging is ever added here, log a STATIC message only: R2 errors
+			// can echo object keys, which must never reach a log line.
+		}
+	}
+
 	return {
 		settings,
 		refImageSrc,
@@ -170,6 +205,8 @@ export const load: PageServerLoad = async ({ platform, url, locals }) => {
 		earlyAccess,
 		imageCount: stats?.count || 0,
 		totalSize: stats?.totalSize || 0,
+		breakdown,
+		breakdownTooLarge,
 		utUsage,
 		storageStatus,
 		registryEnabled: isRegistryEnabled(renv),

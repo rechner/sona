@@ -16,6 +16,7 @@
 	import { resendSetupProgress } from '$lib/resend-setup';
 	import { resolveTabId, visibleTabIds, type TabId } from './tabs';
 	import { showUtFileStat } from './ut-stat';
+	import { breakdownRows, sharePct, usageWarning } from './storage-breakdown-view';
 	import { baseLocale, locales } from '$lib/paraglide/runtime';
 	import { earlyAccessLabel } from '$lib/early-access';
 	import * as m from '$lib/paraglide/messages';
@@ -235,15 +236,22 @@
 		tabButtons[next]?.focus();
 	}
 
-	// Usage bar reflects the ACTIVE provider. R2 has no simple usage API, so we use
-	// the DB-tracked total (every image is on the active store) against the 10GB free tier.
+	// Usage bar reflects the ACTIVE provider. On R2 the bucket listing (SONA-192)
+	// is the truth when available — it counts files D1 never tracked; the
+	// DB-tracked total is the fallback when the list failed. UT keeps its own
+	// usage API numbers.
 	const activeUsage = $derived(
 		data.settings.storageProvider === 'r2'
-			? { label: 'Cloudflare R2', used: data.totalSize, limit: R2_FREE_TIER_BYTES }
+			? {
+					label: 'Cloudflare R2',
+					used: data.breakdown?.totalBytes ?? data.totalSize,
+					limit: R2_FREE_TIER_BYTES
+				}
 			: data.utUsage
 				? { label: 'UploadThing', used: data.utUsage.usedBytes, limit: data.utUsage.limitBytes }
 				: null
 	);
+
 	// Originals still sitting on UploadThing after migrating to R2.
 	const utLeftover = $derived(
 		data.settings.storageProvider === 'r2' && data.utUsage && data.utUsage.usedBytes > 0
@@ -664,42 +672,112 @@
 			<h2>{m.admin_settings_tab_storage()}</h2>
 			{#if activeUsage}
 				{@const pct = Math.min(100, (activeUsage.used / activeUsage.limit) * 100)}
+				{@const warn = usageWarning(pct)}
 				<div class="storage-bar-wrap">
 					<div class="storage-bar-header">
 						<span>{m.admin_settings_usage({ label: activeUsage.label, used: formatSize(activeUsage.used), limit: formatSize(activeUsage.limit) })}</span>
-						<span class="storage-pct">{pct.toFixed(1)}%</span>
+						<!-- The header percentage carries the >80% / >95% signal in every
+					     branch (the fallback branch's bar fill colors agree with it).
+					     The worded suffix keeps the state readable without color
+					     (WCAG 1.4.1). -->
+					<span class="storage-pct" class:warning={warn === 'near'} class:danger={warn === 'full'}>{pct.toFixed(1)}%{#if warn === 'full'}{` · ${m.admin_settings_usage_full()}`}{:else if warn === 'near'}{` · ${m.admin_settings_usage_near()}`}{/if}</span>
 					</div>
-					<div class="storage-bar">
-						<div class="storage-bar-fill" style="width: {pct}%" class:warning={pct > 80} class:danger={pct > 95}></div>
-					</div>
+					{#if data.breakdown}
+						<!-- Redundant visual summary of the table below, so it's hidden from
+						     the accessibility tree (six values; progressbar can't express it).
+						     Segment order is locked to the table's row order. -->
+						<div class="storage-bar" aria-hidden="true">
+							{#each breakdownRows as row (row.kind)}
+								{#if data.breakdown.kinds[row.kind].bytes > 0}
+									<div
+										class="storage-seg seg-{row.kind}"
+										style="width: {(data.breakdown.kinds[row.kind].bytes / activeUsage.limit) * 100}%"
+									></div>
+								{/if}
+							{/each}
+						</div>
+					{:else}
+						<div class="storage-bar">
+							<div class="storage-bar-fill" style="width: {pct}%" class:warning={pct > 80} class:danger={pct > 95}></div>
+						</div>
+					{/if}
 				</div>
+			{/if}
+			{#if data.breakdown}
+				<table class="breakdown">
+					<caption class="sr-only">{m.admin_settings_breakdown_caption()}</caption>
+					<thead>
+						<tr>
+							<th scope="col" class="col-type">{m.admin_settings_breakdown_type()}</th>
+							<th scope="col"><span class="sr-only">{m.admin_settings_breakdown_files()}</span></th>
+							<th scope="col" class="col-size">{m.admin_settings_breakdown_size()}</th>
+							<!-- ≤520px the full header is sr-only and the short "Share" shows
+							     instead (aria-hidden — the accessible name stays the full
+							     phrase at every width). -->
+							<th scope="col" class="col-share"><span class="share-full">{m.admin_settings_breakdown_share()}</span><span class="share-short" aria-hidden="true">{m.admin_settings_breakdown_share_short()}</span></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each breakdownRows as row (row.kind)}
+							{@const usage = data.breakdown.kinds[row.kind]}
+							<!-- Zero-byte rows stay (the fixed row set is the legend) but are
+							     dimmed, with an outline swatch. -->
+							<tr class:zero={usage.bytes === 0}>
+								<th scope="row" class="col-type"><span class="swatch seg-{row.kind}" aria-hidden="true"></span>{row.label()}</th>
+								<td class="col-files">{m.admin_settings_breakdown_file_count({ count: usage.count })}</td>
+								<td class="col-size">{formatSize(usage.bytes)}</td>
+								<td class="col-share">{sharePct(usage.bytes, data.breakdown.totalBytes)}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{:else if data.settings.storageProvider === 'uploadthing'}
+				<p class="breakdown-r2-note">{m.admin_settings_breakdown_r2_only()}</p>
+			{:else if data.breakdownTooLarge}
+				<!-- R2, bucket past the listing page cap: not an outage — a partial
+				     breakdown would misstate every share, so say why instead. -->
+				<p class="breakdown-r2-note">{m.admin_settings_breakdown_too_large()}</p>
+			{:else}
+				<!-- R2 with no breakdown: the bucket listing failed or timed out, so
+				     the bar above fell back to the D1 sum — say so. -->
+				<p class="breakdown-r2-note">{m.admin_settings_breakdown_unavailable()}</p>
 			{/if}
 			{#if utLeftover > 0}
 				<p class="ut-leftover">
 					{m.admin_settings_ut_leftover_pre({ size: formatSize(utLeftover) })}<a href="/admin/storage/migrate">{m.admin_settings_ut_leftover_link()}</a>{m.admin_settings_ut_leftover_post()}
 				</p>
 			{/if}
-			<div class="storage-info">
+			<dl class="storage-info">
 				<div class="storage-stat">
-					<span class="stat-label">{m.admin_settings_stat_tracked()}</span>
-					<span class="stat-value">{formatSize(data.totalSize)}</span>
+					<!-- Deliberately the D1 sum, labelled "In database" to name its
+					     source; the bar header above already shows the bucket total, so
+					     the DB-vs-bucket delta stays visible. -->
+					<dt class="stat-label">{m.admin_settings_stat_tracked()}</dt>
+					<dd class="stat-value">{formatSize(data.totalSize)}</dd>
 				</div>
-				<div class="storage-stat">
-					<span class="stat-label">{m.admin_tab_images()}</span>
-					<span class="stat-value">{data.imageCount}</span>
-				</div>
+				{#if data.breakdown}
+					<div class="storage-stat">
+						<dt class="stat-label">{m.admin_settings_stat_bucket_files()}</dt>
+						<dd class="stat-value">{data.breakdown.totalCount}</dd>
+					</div>
+				{:else}
+					<div class="storage-stat">
+						<dt class="stat-label">{m.admin_tab_images()}</dt>
+						<dd class="stat-value">{data.imageCount}</dd>
+					</div>
+				{/if}
 				<!-- Hidden on R2 (stale UT count); see showUtFileStat in ./ut-stat. -->
 				{#if showUtFileStat(data)}
 					<div class="storage-stat">
-						<span class="stat-label">{m.admin_settings_stat_ut_files()}</span>
-						<span class="stat-value">{data.utUsage.filesUploaded}</span>
+						<dt class="stat-label">{m.admin_settings_stat_ut_files()}</dt>
+						<dd class="stat-value">{data.utUsage.filesUploaded}</dd>
 					</div>
 				{/if}
 				<div class="storage-stat">
-					<span class="stat-label">{m.admin_settings_stat_provider()}</span>
-					<span class="stat-value provider">{data.settings.storageProvider === 'r2' ? 'Cloudflare R2' : 'UploadThing'}</span>
+					<dt class="stat-label">{m.admin_settings_stat_provider()}</dt>
+					<dd class="stat-value provider">{data.settings.storageProvider === 'r2' ? 'Cloudflare R2' : 'UploadThing'}</dd>
 				</div>
-			</div>
+			</dl>
 		</section>
 
 <form method="POST" action="?/saveStorage" class="contents" use:enhance={() => {
@@ -1527,9 +1605,15 @@
 		margin-bottom: 12px;
 	}
 
+	/* wrap + column-gap: at narrow widths the percentage drops to its own line
+	   instead of abutting the usage text; margin-left:auto keeps it right-
+	   aligned on that wrapped line (it's the last flex child, so at full width
+	   space-between already places it right and the margin is a no-op). */
 	.storage-bar-header {
 		display: flex;
+		flex-wrap: wrap;
 		justify-content: space-between;
+		column-gap: 24px;
 		font-size: 13px;
 		color: var(--muted-foreground);
 		margin-bottom: 6px;
@@ -1539,9 +1623,11 @@
 		font-family: var(--font-primary);
 		font-weight: 600;
 		color: var(--foreground);
+		margin-left: auto;
 	}
 
 	.storage-bar {
+		display: flex;
 		width: 100%;
 		height: 8px;
 		background: var(--secondary);
@@ -1563,13 +1649,267 @@
 		background: var(--destructive);
 	}
 
+	/* The colored + worded percentage renders in BOTH branches; the fallback
+	   bar's warning/danger fill above mirrors the same >80% / >95% thresholds,
+	   so text and fill always agree. As TEXT the amber needs 4.5:1, which
+	   #f0b33a only clears on the dark themes (10.08:1 on the #111111
+	   --background the text sits on) — light gets a dark amber (#7a4f00:
+	   6.40:1 on #F2F3F0). --destructive clears 4.5:1
+	   as text in every theme. */
+	.storage-pct.warning {
+		color: #f0b33a;
+	}
+
+	:global([data-theme='light']) .storage-pct.warning {
+		color: #7a4f00;
+	}
+
+	.storage-pct.danger {
+		color: var(--destructive);
+	}
+
+	/* Outranks the light warning override above, so >95% escalates to red on
+	   light themes even if both classes ever apply together again. */
+	:global([data-theme='light']) .storage-pct.danger {
+		color: var(--destructive);
+	}
+
+	/* ── Per-type breakdown (SONA-192) ─────────────────────────────────────
+	   The segmented bar is aria-hidden (the table carries the data); segment
+	   order is locked to row order. Separators use the page background so
+	   adjacent segments stay distinguishable (WCAG 1.4.11) in every theme.
+	   Colors are validated ≥3:1 against the track in the default palettes:
+	   the dark set on #2E2E2E, the light set on #E7E8E5 and white. Both
+	   vrImage teals sit outside the orange family so they can't be read as a
+	   shade of artwork (light #0F766E: 4.45:1 on #E7E8E5, 5.47:1 on #FFFFFF;
+	   dark #2DD4BF: 7.30:1 on #2E2E2E). Fursuit violet: dark #C4B5FD 7.36:1
+	   on #2E2E2E, light #6D28D9 5.78:1 on #E7E8E5, 7.10:1 on #FFFFFF. Dark
+	   other #9AA5B1: 5.43:1 on #2E2E2E, clearly apart from the empty track. */
+	.storage-seg {
+		height: 100%;
+	}
+
+	.storage-seg + .storage-seg {
+		border-left: 2px solid var(--background);
+	}
+
+	.seg-artwork {
+		background: #ff8400;
+	}
+	.seg-vrVideo {
+		background: #4fa3ff;
+	}
+	.seg-vrModel {
+		background: #4ade80;
+	}
+	.seg-sticker {
+		background: #e879f9;
+	}
+	.seg-vrImage {
+		background: #2dd4bf;
+	}
+	.seg-fursuit {
+		background: #c4b5fd;
+	}
+	.seg-other {
+		background: #9aa5b1;
+	}
+
+	:global([data-theme='light']) .seg-artwork {
+		background: #c2410c;
+	}
+	:global([data-theme='light']) .seg-vrVideo {
+		background: #2563eb;
+	}
+	:global([data-theme='light']) .seg-vrModel {
+		background: #15803d;
+	}
+	:global([data-theme='light']) .seg-sticker {
+		background: #a21caf;
+	}
+	:global([data-theme='light']) .seg-vrImage {
+		background: #0f766e;
+	}
+	:global([data-theme='light']) .seg-fursuit {
+		background: #6d28d9;
+	}
+	:global([data-theme='light']) .seg-other {
+		background: #57606a;
+	}
+
+	.breakdown {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 13.5px;
+	}
+
+	/* thead-scoped: the type cells in tbody are row headers (th scope="row")
+	   and keep the body-cell styling below instead. */
+	.breakdown thead th {
+		padding: 8px 2px 2px;
+		border-top: 1px solid var(--border);
+		font-size: 12px;
+		font-weight: 400;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--muted-foreground);
+		text-align: left;
+		vertical-align: bottom;
+		white-space: nowrap;
+	}
+
+	.breakdown th.col-size,
+	.breakdown th.col-share,
+	.breakdown td.col-size,
+	.breakdown td.col-share {
+		text-align: right;
+	}
+
+	.breakdown th.col-share {
+		padding-left: 12px;
+	}
+
+	.breakdown td,
+	.breakdown tbody th {
+		padding: 8px 2px;
+		border-bottom: 1px solid var(--border);
+		vertical-align: middle;
+	}
+
+	.breakdown tr:last-child td,
+	.breakdown tr:last-child th {
+		border-bottom: none;
+	}
+
+	.breakdown tbody th.col-type {
+		font-weight: 500;
+		text-align: left;
+		padding-right: 10px;
+		white-space: nowrap;
+	}
+
+	/* The files column absorbs the free width so type + count hug the left edge
+	   and size + share hug the right, like the usage bar above. */
+	.breakdown td.col-files {
+		width: 99%;
+		color: var(--muted-foreground);
+		font-size: 13px;
+		white-space: nowrap;
+		padding-right: 10px;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.breakdown td.col-size {
+		font-family: var(--font-primary);
+		font-weight: 600;
+		font-size: 13px;
+		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.breakdown td.col-share {
+		color: var(--muted-foreground);
+		font-size: 13px;
+		min-width: 56px;
+		white-space: nowrap;
+		padding-left: 12px;
+		font-variant-numeric: tabular-nums;
+	}
+
+	/* Desktop shows the full "Share of used" header; the short twin only
+	   exists ≤520px (aria-hidden, with the full phrase kept sr-only there, so
+	   the accessible name never changes). */
+	.breakdown thead th .share-short {
+		display: none;
+	}
+
+	/* 320px reflow (WCAG 1.4.10): let the type labels and headers wrap
+	   instead of scrolling, and hand the flexible width to the label column
+	   (width: 99%, same trick as the base col-files rule) so it takes the
+	   slack on mobile. File counts, size, and share keep their base nowrap —
+	   measured at a 320px viewport / 288px container with worst-case values
+	   ("VR showcase videos" / "Avatars & other files", "20000 files" — the
+	   message renders raw counts, no separator, and the 20-page listing cap
+	   bounds it — "1023.9 GB", "100%", en and ja), the table still fits, and
+	   a mid-value line break would misread as two values. Every base rule
+	   above precedes this block so the overrides here actually win. */
+	@media (max-width: 520px) {
+		.breakdown thead th {
+			white-space: normal;
+		}
+
+		.breakdown thead th .share-full {
+			position: absolute;
+			width: 1px;
+			height: 1px;
+			padding: 0;
+			margin: -1px;
+			overflow: hidden;
+			clip: rect(0, 0, 0, 0);
+			white-space: nowrap;
+			border: 0;
+		}
+
+		.breakdown thead th .share-short {
+			display: inline;
+		}
+
+		.breakdown tbody th.col-type {
+			white-space: normal;
+			width: 99%;
+		}
+
+		.breakdown td.col-files {
+			width: auto;
+			padding-right: 6px;
+		}
+
+		.breakdown td.col-share {
+			min-width: 0;
+			padding-left: 6px;
+		}
+	}
+
+	.swatch {
+		display: inline-block;
+		width: 9px;
+		height: 9px;
+		border-radius: 3px;
+		margin-right: 10px;
+		vertical-align: 1px;
+	}
+
+	/* Zero-byte kinds: muted row, outline swatch — present as a legend entry
+	   without competing with the rows that hold actual bytes. */
+	.breakdown tr.zero td,
+	.breakdown tr.zero th {
+		color: var(--muted-foreground);
+		font-weight: 400;
+	}
+
+	.breakdown tr.zero .swatch {
+		background: transparent;
+		border: 1px solid var(--muted-foreground);
+	}
+
+	.breakdown-r2-note {
+		font-size: 13px;
+		color: var(--muted-foreground);
+		margin: 12px 0;
+	}
+
 	.storage-info {
 		display: flex;
 		gap: 32px;
+		margin: 0;
 		padding: 16px;
 		background: var(--card);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-s);
+	}
+
+	.storage-info dd {
+		margin: 0;
 	}
 
 	.storage-stat {

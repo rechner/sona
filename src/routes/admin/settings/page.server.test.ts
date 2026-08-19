@@ -1399,3 +1399,210 @@ describe('deleteAll — every content table in the backup is wiped', () => {
 		}
 	});
 });
+
+describe('settings load — storage breakdown (SONA-192)', () => {
+	function stubBucket(pages: { key: string; size: number }[][]) {
+		let calls = 0;
+		return {
+			list: vi.fn(async () => {
+				const objects = pages[calls];
+				calls += 1;
+				return {
+					objects,
+					truncated: calls < pages.length,
+					cursor: calls < pages.length ? String(calls) : undefined
+				};
+			})
+		};
+	}
+
+	it('skips the bucket listing entirely on UploadThing (breakdown null, list never called)', async () => {
+		const bucket = stubBucket([[]]);
+		const { db, platform } = makeLoadDb({ IMAGES: bucket });
+		await setRawSetting(db, 'storageProvider', 'uploadthing');
+
+		const result = (await load(loadEvent(platform))) as unknown as { breakdown: unknown };
+
+		expect(result.breakdown).toBeNull();
+		expect(bucket.list).not.toHaveBeenCalled();
+	});
+
+	it('collects the paginated breakdown on R2 with matching totals', async () => {
+		const bucket = stubBucket([
+			[
+				{ key: 'artwork/a.png', size: 100 },
+				{ key: 'vr-media/clip.webm', size: 700 }
+			],
+			[{ key: 'stickers/p/s.webp', size: 10 }]
+		]);
+		const { db, platform } = makeLoadDb({ IMAGES: bucket });
+		await setRawSetting(db, 'storageProvider', 'r2');
+
+		const result = (await load(loadEvent(platform))) as unknown as {
+			breakdown: {
+				totalBytes: number;
+				totalCount: number;
+				kinds: Record<string, { bytes: number; count: number }>;
+			} | null;
+		};
+
+		expect(bucket.list).toHaveBeenCalledTimes(2);
+		expect(result.breakdown).toMatchObject({ totalBytes: 810, totalCount: 3 });
+		expect(result.breakdown!.kinds.vrVideo).toEqual({ bytes: 700, count: 1 });
+	});
+
+	it('degrades to breakdown null (payload intact, no throw) when the R2 list rejects', async () => {
+		const bucket = {
+			list: vi.fn(async (): Promise<never> => {
+				throw new Error('R2 down: artwork/some-object-key.png');
+			})
+		};
+		const { db, platform } = makeLoadDb({ IMAGES: bucket });
+		await setRawSetting(db, 'storageProvider', 'r2');
+		// Seed the D1-backed fields the load resolves BEFORE the bucket listing:
+		// the listing runs last (free-plan subrequest budget — see the loader
+		// comment), so a listing failure must never cost these.
+		await setRawSetting(db, 'adminEmail', 'recover@taro.surf');
+		await setRawSetting(db, 'supporterKey', 'head.tail');
+		vi.mocked(verifySupporterKey).mockResolvedValueOnce({
+			valid: true,
+			login: 'sparky',
+			tier: 2,
+			expiresAt: new Date('2026-09-01T00:00:00Z')
+		});
+
+		const result = (await load(loadEvent(platform))) as unknown as {
+			breakdown: unknown;
+			breakdownTooLarge: boolean;
+			settings: Record<string, unknown>;
+			imageCount: number;
+			storageStatus: { r2: boolean };
+			adminEmail: string;
+			supporterKey: { state: string } | null;
+			registryEnabled: boolean;
+		};
+
+		expect(result.breakdown).toBeNull();
+		// A FAILED listing is not the too-large case — the page keys its two
+		// R2 no-breakdown notes on this flag.
+		expect(result.breakdownTooLarge).toBe(false);
+		// The rest of the payload still rides — the tab keeps its aggregate bar,
+		// and every D1-dependent field resolved before the listing failed.
+		expect(result.settings.storageProvider).toBe('r2');
+		expect(result.imageCount).toBe(0);
+		expect(result.storageStatus.r2).toBe(true);
+		expect(result.adminEmail).toBe('recover@taro.surf');
+		expect(result.supporterKey).toMatchObject({ state: 'valid' });
+		expect(result.registryEnabled).toBe(false);
+		// Key-privacy invariant: an R2 error can echo an object key, and that
+		// key must never ride anywhere in the page payload.
+		expect(JSON.stringify(result)).not.toContain('some-object-key');
+	});
+
+	it('surfaces the too-large discriminant when the bucket outgrows the page cap', async () => {
+		// Endlessly truncated: every page says there's more. The collector stops
+		// at its cap and the loader maps that to breakdownTooLarge instead of a
+		// breakdown (or a failure).
+		let calls = 0;
+		const bucket = {
+			list: vi.fn(async () => {
+				calls += 1;
+				return {
+					objects: [{ key: 'artwork/a.png', size: 1 }],
+					truncated: true,
+					cursor: String(calls)
+				};
+			})
+		};
+		const { db, platform } = makeLoadDb({ IMAGES: bucket });
+		await setRawSetting(db, 'storageProvider', 'r2');
+
+		const result = (await load(loadEvent(platform))) as unknown as {
+			breakdown: unknown;
+			breakdownTooLarge: boolean;
+		};
+
+		expect(result.breakdown).toBeNull();
+		expect(result.breakdownTooLarge).toBe(true);
+		// The cap still bounds the subrequests: exactly the default 20 pages.
+		expect(bucket.list).toHaveBeenCalledTimes(20);
+	});
+
+	// Source pin (SONA-183 precedent): the three no-breakdown notes are branch-
+	// keyed, and no unit render exercises them — swapping the messages (or
+	// collapsing the branches) would leave the suite green while an R2 outage
+	// reads as "R2 only" (or as "too many files") to a fork already ON R2.
+	it('the no-breakdown notes are wired to the right branches', () => {
+		const src = readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+		const branches = src.match(
+			/\{:else if data\.settings\.storageProvider === 'uploadthing'\}([\s\S]*?)\{:else if data\.breakdownTooLarge\}([\s\S]*?)\{:else\}([\s\S]*?)\{\/if\}/
+		);
+		expect(branches, 'uploadthing/too-large/else branch triple').not.toBeNull();
+		// UploadThing: no per-prefix listing exists — the R2-only pointer.
+		expect(branches![1]).toContain('m.admin_settings_breakdown_r2_only()');
+		expect(branches![1]).not.toContain('m.admin_settings_breakdown_unavailable()');
+		// R2, bucket past the page cap: the too-large note, not the outage one.
+		expect(branches![2]).toContain('m.admin_settings_breakdown_too_large()');
+		expect(branches![2]).not.toContain('m.admin_settings_breakdown_unavailable()');
+		// R2 with no breakdown and not too large: the listing failed.
+		expect(branches![3]).toContain('m.admin_settings_breakdown_unavailable()');
+		expect(branches![3]).not.toContain('m.admin_settings_breakdown_too_large()');
+	});
+
+	// Source pin: the warning const and the worded percentage span must sit
+	// BEFORE the {#if data.breakdown} bar split, not inside the breakdown
+	// branch — re-gating them there would strip the worded suffix from the
+	// fallback branch and leave a color-only signal (WCAG 1.4.1) with the
+	// suite green.
+	it('the usage warning is not gated on the breakdown', () => {
+		const src = readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+		const constIdx = src.indexOf('{@const warn = usageWarning(pct)}');
+		const spanIdx = src.indexOf('class="storage-pct"');
+		const barSplitIdx = src.indexOf('{#if data.breakdown}');
+		expect(constIdx).toBeGreaterThan(-1);
+		expect(spanIdx).toBeGreaterThan(-1);
+		expect(barSplitIdx).toBeGreaterThan(-1);
+		expect(constIdx).toBeLessThan(barSplitIdx);
+		expect(spanIdx).toBeLessThan(barSplitIdx);
+		// The span carries both the color classes and the worded suffixes.
+		const span = src.slice(spanIdx, src.indexOf('</span>', spanIdx));
+		expect(span).toContain('class:warning={warn ===');
+		expect(span).toContain('class:danger={warn ===');
+		expect(span).toContain('m.admin_settings_usage_near()');
+		expect(span).toContain('m.admin_settings_usage_full()');
+	});
+
+	// Source pin: the Bucket files tile renders the raw count. A locale-aware
+	// format (toLocaleString) diverges between SSR (workerd en-US) and the
+	// client's browser locale — a hydration text mismatch — and disagrees with
+	// the raw-count Files column.
+	it('the Bucket files tile renders the raw count', () => {
+		const src = readFileSync(new URL('./+page.svelte', import.meta.url), 'utf8');
+		expect(src).toContain('{data.breakdown.totalCount}');
+		expect(src).not.toContain('totalCount.toLocaleString');
+	});
+
+	it('degrades to breakdown null when the listing never settles (5s deadline)', async () => {
+		vi.useFakeTimers();
+		try {
+			// A bucket whose list() hangs forever — only the deadline can win.
+			const bucket = { list: vi.fn(() => new Promise<never>(() => {})) };
+			const { db, platform } = makeLoadDb({ IMAGES: bucket });
+			await setRawSetting(db, 'storageProvider', 'r2');
+
+			const pending = load(loadEvent(platform)) as Promise<{
+				breakdown: unknown;
+				settings: Record<string, unknown>;
+				storageStatus: { r2: boolean };
+			}>;
+			await vi.advanceTimersByTimeAsync(5000);
+			const result = await pending;
+
+			expect(result.breakdown).toBeNull();
+			expect(result.settings.storageProvider).toBe('r2');
+			expect(result.storageStatus.r2).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
